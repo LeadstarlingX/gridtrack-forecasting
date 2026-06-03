@@ -25,7 +25,8 @@ async def test_anomaly_pipeline_publishes_urgency_result(rabbitmq_url, mocker):
 
     conn, channel = await _get_channel(rabbitmq_url)
 
-    result_queue = await channel.declare_queue("gridtrack.urgency-results", durable=False)
+    result_queue = await channel.declare_queue("gridtrack.urgency-results", durable=True)
+    await result_queue.purge()  # clear any leftovers from prior tests in this session
 
     event = DeliveryAnomalyIntegrationEvent(
         deliveryId=uuid4(),
@@ -58,7 +59,8 @@ async def test_publisher_routes_forecast_to_correct_queue(rabbitmq_url):
     from app.models import ForecastResultMessage
 
     conn, channel = await _get_channel(rabbitmq_url)
-    queue = await channel.declare_queue("gridtrack.forecast-results", durable=False)
+    queue = await channel.declare_queue("gridtrack.forecast-results", durable=True)
+    await queue.purge()
 
     msg = ForecastResultMessage(
         districtId="babtouma",
