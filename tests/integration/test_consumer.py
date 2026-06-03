@@ -51,10 +51,10 @@ async def running_consumer(rabbitmq_url, mocker):
     setup_channel = await setup_conn.channel()
 
     urgency_q = await setup_channel.declare_queue(
-        "gridtrack.urgency-results", durable=False, auto_delete=False
+        "gridtrack.urgency-results", durable=True
     )
     forecast_q = await setup_channel.declare_queue(
-        "gridtrack.forecast-results", durable=False, auto_delete=False
+        "gridtrack.forecast-results", durable=True
     )
     await urgency_q.purge()
     await forecast_q.purge()
