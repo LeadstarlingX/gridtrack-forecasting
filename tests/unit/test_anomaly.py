@@ -4,7 +4,7 @@ from uuid import uuid4
 import pytest
 
 from app.models import DeliveryAnomalyIntegrationEvent
-from app.services.anomaly import score_anomaly, URGENCY_BASE, DISTRICT_BOOST
+from app.services.anomaly import score_anomaly, _fallback_note, URGENCY_BASE, DISTRICT_BOOST
 
 
 def make_event(anomaly_type="StalePosition", district="mezzeh"):
@@ -52,3 +52,36 @@ async def test_delivery_id_is_string_in_result(mocker):
     event = make_event()
     result = await score_anomaly(event)
     assert result.deliveryId == str(event.deliveryId)
+
+
+# ── Extended edge-case tests ───────────────────────────────────────────────────
+
+async def test_unknown_anomaly_type_defaults_to_score_2(mocker):
+    mocker.patch("app.services.anomaly._groq_note", return_value="check")
+    result = await score_anomaly(make_event("SomeUnknownAnomalyType", "mezzeh"))
+    assert result.urgencyScore == 2  # dict.get fallback
+
+
+async def test_unknown_district_receives_no_boost(mocker):
+    mocker.patch("app.services.anomaly._groq_note", return_value="check")
+    result = await score_anomaly(make_event("EtaExceeded", "newdistrict"))
+    assert result.urgencyScore == URGENCY_BASE["EtaExceeded"]  # 0 boost
+
+
+# _fallback_note is pure — test it directly without going through the Groq path
+
+def test_fallback_note_critical_when_score_8_or_more():
+    note = _fallback_note(make_event(), 8)
+    assert note.startswith("Critical")
+
+
+def test_fallback_note_high_when_score_is_6_or_7():
+    note = _fallback_note(make_event(), 6)
+    assert note.startswith("High")
+    note7 = _fallback_note(make_event(), 7)
+    assert note7.startswith("High")
+
+
+def test_fallback_note_moderate_when_score_below_6():
+    note = _fallback_note(make_event(), 3)
+    assert note.startswith("Moderate")
