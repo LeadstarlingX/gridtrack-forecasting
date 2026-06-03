@@ -87,6 +87,27 @@ async def _publish(url: str, exchange_name: str, body: bytes, content_type: str 
     await conn.close()
 
 
+async def _wait_for_message(
+    queue: aio_pika.abc.AbstractQueue, timeout: float = 10.0
+) -> aio_pika.abc.AbstractIncomingMessage:
+    """Poll queue until a message is available or the timeout expires.
+
+    aio_pika's Queue.get() uses AMQP basic.get (a non-blocking pull): it raises
+    QueueEmpty immediately if no message is ready. asyncio.wait_for() doesn't
+    help because the coroutine completes instantly rather than blocking. This
+    helper retries every 200 ms so tests don't race against consumer processing.
+    """
+    start = asyncio.get_event_loop().time()
+    while True:
+        try:
+            return await queue.get(no_ack=True)
+        except aio_pika.exceptions.QueueEmpty:
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed >= timeout:
+                raise TimeoutError(f"No message arrived after {timeout:.0f} s")
+            await asyncio.sleep(0.2)
+
+
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 
@@ -109,7 +130,7 @@ async def test_anomaly_event_produces_urgency_result(running_consumer, rabbitmq_
     )
     await _publish(rabbitmq_url, "gridtrack.anomaly", event.model_dump_json().encode())
 
-    msg = await asyncio.wait_for(urgency_q.get(no_ack=True), timeout=10.0)
+    msg = await _wait_for_message(urgency_q)
     payload = json.loads(msg.body)
 
     assert payload["deliveryId"] == str(delivery_id)
@@ -135,7 +156,7 @@ async def test_urgency_result_matches_dotnet_contract(running_consumer, rabbitmq
     )
     await _publish(rabbitmq_url, "gridtrack.anomaly", event.model_dump_json().encode())
 
-    msg = await asyncio.wait_for(urgency_q.get(no_ack=True), timeout=10.0)
+    msg = await _wait_for_message(urgency_q)
     payload = json.loads(msg.body)
 
     assert set(payload.keys()) == {"deliveryId", "urgencyScore", "aiNote"}
@@ -163,7 +184,7 @@ async def test_position_event_produces_forecast_result(running_consumer, rabbitm
     )
     await _publish(rabbitmq_url, "gridtrack.positions", event.model_dump_json().encode())
 
-    msg = await asyncio.wait_for(forecast_q.get(no_ack=True), timeout=10.0)
+    msg = await _wait_for_message(forecast_q)
     payload = json.loads(msg.body)
 
     assert payload["districtId"] == district
@@ -186,7 +207,7 @@ async def test_forecast_result_matches_dotnet_contract(running_consumer, rabbitm
     )
     await _publish(rabbitmq_url, "gridtrack.positions", event.model_dump_json().encode())
 
-    msg = await asyncio.wait_for(forecast_q.get(no_ack=True), timeout=10.0)
+    msg = await _wait_for_message(forecast_q)
     payload = json.loads(msg.body)
 
     assert set(payload.keys()) == {
@@ -240,7 +261,7 @@ async def test_malformed_message_is_skipped_consumer_survives(running_consumer, 
     )
     await conn.close()
 
-    msg = await asyncio.wait_for(urgency_q.get(no_ack=True), timeout=10.0)
+    msg = await _wait_for_message(urgency_q)
     payload = json.loads(msg.body)
     assert payload["deliveryId"] == str(delivery_id)
 
@@ -280,7 +301,7 @@ async def test_burst_of_anomaly_events_all_processed(running_consumer, rabbitmq_
 
     received = set()
     for _ in range(3):
-        msg = await asyncio.wait_for(urgency_q.get(no_ack=True), timeout=10.0)
+        msg = await _wait_for_message(urgency_q)
         received.add(json.loads(msg.body)["deliveryId"])
 
     assert received == {str(d) for d in delivery_ids}
