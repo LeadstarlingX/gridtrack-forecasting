@@ -305,3 +305,191 @@ async def test_burst_of_anomaly_events_all_processed(running_consumer, rabbitmq_
         received.add(json.loads(msg.body)["deliveryId"])
 
     assert received == {str(d) for d in delivery_ids}
+
+
+async def test_forecast_throttle_suppresses_second_emit_from_same_district(
+    running_consumer, rabbitmq_url
+):
+    """
+    The forecast service throttles output to one result per district per 5 minutes.
+    A second position event published immediately after the first must NOT produce
+    a second ForecastResultMessage on the queue.
+    """
+    _, _, forecast_q = running_consumer
+
+    district = "mezzeh"
+
+    def _position_event():
+        return DriverPositionIntegrationEvent(
+            driverId=uuid4(),
+            districtId=district,
+            lat=33.505,
+            lng=36.243,
+            deliveryStatus="InTransit",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    # First event — no prior last_emit for this district → always emits
+    await _publish(rabbitmq_url, "gridtrack.positions", _position_event().model_dump_json().encode())
+    first = await _wait_for_message(forecast_q)
+    assert json.loads(first.body)["districtId"] == district
+
+    # Second event for the same district within the 5-min window → must be throttled
+    await _publish(rabbitmq_url, "gridtrack.positions", _position_event().model_dump_json().encode())
+
+    # Allow 2 s for consumer to process; if throttle fails a result would appear
+    await asyncio.sleep(2.0)
+    try:
+        await _wait_for_message(forecast_q, timeout=0.5)
+        pytest.fail("A second forecast was emitted — throttle did not suppress it")
+    except TimeoutError:
+        pass  # Correct: no second result within the throttle window
+
+
+async def test_district_boost_reflected_in_urgency_score(running_consumer, rabbitmq_url):
+    """
+    The district-boost table adds points to the base score.
+    StalePosition in mezzeh  → 5 + 0 = 5
+    StalePosition in kafrsousa → 5 + 2 = 7
+    Both scores must match exactly through the full consumer pipeline.
+    """
+    _, urgency_q, _ = running_consumer
+
+    mezzeh_id = uuid4()
+    kafr_id = uuid4()
+
+    for delivery_id, district in [(mezzeh_id, "mezzeh"), (kafr_id, "kafrsousa")]:
+        event = DeliveryAnomalyIntegrationEvent(
+            deliveryId=delivery_id,
+            districtId=district,
+            anomalyType="StalePosition",
+            reason="No GPS ping",
+            driverLat=33.505,
+            driverLng=36.243,
+            occurredAt=datetime.now(timezone.utc),
+        )
+        await _publish(rabbitmq_url, "gridtrack.anomaly", event.model_dump_json().encode())
+
+    # Collect both results (order not guaranteed)
+    scores: dict[str, int] = {}
+    for _ in range(2):
+        payload = json.loads((await _wait_for_message(urgency_q)).body)
+        scores[payload["deliveryId"]] = payload["urgencyScore"]
+
+    assert scores[str(mezzeh_id)] == 5   # base=5, boost=0
+    assert scores[str(kafr_id)] == 7     # base=5, boost=2
+
+
+async def test_unknown_anomaly_type_uses_default_score(running_consumer, rabbitmq_url):
+    """
+    An anomaly type not present in URGENCY_BASE must still produce a valid
+    UrgencyResultMessage with urgencyScore=2 (the dict.get() fallback).
+    The consumer must not crash or drop the message.
+    """
+    _, urgency_q, _ = running_consumer
+
+    delivery_id = uuid4()
+    event = DeliveryAnomalyIntegrationEvent(
+        deliveryId=delivery_id,
+        districtId="mezzeh",
+        anomalyType="SomeNewAnomalyTypeNotInTable",
+        reason="Unrecognised anomaly detected",
+        driverLat=33.505,
+        driverLng=36.243,
+        occurredAt=datetime.now(timezone.utc),
+    )
+    await _publish(rabbitmq_url, "gridtrack.anomaly", event.model_dump_json().encode())
+
+    msg = await _wait_for_message(urgency_q)
+    payload = json.loads(msg.body)
+
+    assert payload["deliveryId"] == str(delivery_id)
+    assert payload["urgencyScore"] == 2  # URGENCY_BASE.get(unknown, 2)
+
+
+async def test_both_exchanges_produce_results_concurrently(running_consumer, rabbitmq_url):
+    """
+    The consumer subscribes to two fanout exchanges simultaneously.
+    Publishing to both at the same time must result in both output queues
+    receiving a message — verifying that neither handler blocks the other.
+    """
+    _, urgency_q, forecast_q = running_consumer
+
+    anomaly_id = uuid4()
+    anomaly_event = DeliveryAnomalyIntegrationEvent(
+        deliveryId=anomaly_id,
+        districtId="malki",
+        anomalyType="RouteDeviation",
+        reason="Took wrong street",
+        driverLat=33.517,
+        driverLng=36.281,
+        occurredAt=datetime.now(timezone.utc),
+    )
+    position_event = DriverPositionIntegrationEvent(
+        driverId=uuid4(),
+        districtId="babtouma",
+        lat=33.522,
+        lng=36.307,
+        deliveryStatus="InTransit",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    # Publish to both exchanges concurrently
+    await asyncio.gather(
+        _publish(rabbitmq_url, "gridtrack.anomaly", anomaly_event.model_dump_json().encode()),
+        _publish(rabbitmq_url, "gridtrack.positions", position_event.model_dump_json().encode()),
+    )
+
+    urgency_payload = json.loads((await _wait_for_message(urgency_q)).body)
+    forecast_payload = json.loads((await _wait_for_message(forecast_q)).body)
+
+    assert urgency_payload["deliveryId"] == str(anomaly_id)
+    assert forecast_payload["districtId"] == "babtouma"
+
+
+async def test_score_table_all_anomaly_types_and_districts(running_consumer, rabbitmq_url):
+    """
+    Parametric coverage of the full URGENCY_BASE × DISTRICT_BOOST score table
+    through the live consumer — guards against silent misconfiguration.
+
+    Expected scores (base + boost):
+      StalePosition  + mezzeh    = 5 + 0 = 5
+      EtaExceeded    + mezzeh    = 3 + 0 = 3
+      RouteDeviation + malki     = 4 + 0 = 4
+      UnexpectedStop + babtouma  = 4 + 1 = 5
+      StalePosition  + kafrsousa = 5 + 2 = 7
+    """
+    _, urgency_q, _ = running_consumer
+
+    cases = [
+        (uuid4(), "StalePosition",  "mezzeh",    5),
+        (uuid4(), "EtaExceeded",    "mezzeh",    3),
+        (uuid4(), "RouteDeviation", "malki",     4),
+        (uuid4(), "UnexpectedStop", "babtouma",  5),
+        (uuid4(), "StalePosition",  "kafrsousa", 7),
+    ]
+
+    # Publish all 5 events before collecting any results
+    for delivery_id, anomaly_type, district, _ in cases:
+        event = DeliveryAnomalyIntegrationEvent(
+            deliveryId=delivery_id,
+            districtId=district,
+            anomalyType=anomaly_type,
+            reason="Score table test",
+            driverLat=33.505,
+            driverLng=36.243,
+            occurredAt=datetime.now(timezone.utc),
+        )
+        await _publish(rabbitmq_url, "gridtrack.anomaly", event.model_dump_json().encode())
+
+    # Collect all 5 results (order not guaranteed — keyed by deliveryId)
+    scores: dict[str, int] = {}
+    for _ in range(5):
+        payload = json.loads((await _wait_for_message(urgency_q)).body)
+        scores[payload["deliveryId"]] = payload["urgencyScore"]
+
+    for delivery_id, anomaly_type, district, expected in cases:
+        got = scores[str(delivery_id)]
+        assert got == expected, (
+            f"{anomaly_type} in {district}: expected urgencyScore={expected}, got={got}"
+        )
