@@ -10,6 +10,7 @@ __pycache__/
 # Environment / secrets
 .env
 SERVICE.md
+python_explanation.md
 
 # Test artifacts
 .pytest_cache/
