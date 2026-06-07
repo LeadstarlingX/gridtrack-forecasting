@@ -12,6 +12,10 @@ from app.models import (
 from app.services.anomaly import score_anomaly
 from app.services.forecast import update_forecast
 
+# Set once all exchanges are declared and queues are bound.
+# Polled by the /ready endpoint so the test factory waits before sending events.
+ready = asyncio.Event()
+
 logger = logging.getLogger(__name__)
 
 EXCHANGE_MAP = {
@@ -56,8 +60,10 @@ async def _run_consumer() -> None:
                 async with msg.process():
                     try:
                         event = _schema.model_validate_json(msg.body)
+                        logger.info("Received %s", _schema.__name__)
                         result = await _handler(event)
                         if result is not None:
+                            logger.info("Publishing %s", type(result).__name__)
                             await publish(channel, result)
                     except Exception as exc:
                         logger.error("Error processing message: %s", exc)
@@ -66,4 +72,5 @@ async def _run_consumer() -> None:
             logger.info("Subscribed to exchange: %s", exchange_name)
 
         logger.info("Consumer ready — waiting for messages")
+        ready.set()
         await asyncio.Future()

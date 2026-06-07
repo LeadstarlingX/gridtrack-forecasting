@@ -17,6 +17,18 @@ async def client(mocker):
         yield ac
 
 
+@pytest.fixture
+async def ready_client(mocker):
+    """ASGI test client with consumer ready event pre-set."""
+    mocker.patch("app.main.start_consumer", new=_fake_consumer)
+    from app.messaging import consumer as _consumer
+    from app.main import app
+    _consumer.ready.set()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        yield ac
+    _consumer.ready.clear()
+
+
 # ── /health ──────────────────────────────────────────────────────────────────
 
 async def test_health_returns_ok(client):
@@ -71,3 +83,26 @@ async def test_chat_missing_context_returns_422(client):
 async def test_chat_empty_body_returns_422(client):
     resp = await client.post("/chat", json={})
     assert resp.status_code == 422
+
+
+# ── /ready ────────────────────────────────────────────────────────────────────
+
+async def test_ready_returns_503_when_consumer_not_subscribed(client):
+    """Consumer event not set → 503 with detail message."""
+    from app.messaging import consumer as _consumer
+    _consumer.ready.clear()
+    resp = await client.get("/ready")
+    assert resp.status_code == 503
+    assert "not yet connected" in resp.json()["detail"]
+
+
+async def test_ready_returns_200_when_consumer_subscribed(ready_client):
+    """`/ready` returns 200 once the consumer has subscribed to all exchanges."""
+    resp = await ready_client.get("/ready")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ready"
+
+
+async def test_ready_rejects_post(client):
+    resp = await client.post("/ready")
+    assert resp.status_code == 405
