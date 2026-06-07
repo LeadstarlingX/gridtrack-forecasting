@@ -40,4 +40,4 @@ async def publish(channel: aio_pika.Channel, message: BaseModel) -> None:
         ),
         routing_key=queue_name,
     )
-    logger.debug("Published %s → %s (type=%s)", type_name, queue_name, message_type)
+    logger.info("Published %s → %s", type_name, queue_name)
