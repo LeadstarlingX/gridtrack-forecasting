@@ -1,0 +1,18 @@
+services:
+  # ── Python Forecasting Service ───────────────────────────────────────────────
+  - type: web
+    name: gridtrack-forecasting
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # CloudAMQP AMQP URL — same value as the API's ConnectionStrings__Queue
+      # Format: amqps://user:pass@host/vhost
+      - key: RABBITMQ_URL
+        sync: false
+      # Groq API key — https://console.groq.com/keys
+      - key: GROQ_API_KEY
+        sync: false
+      # Google AI API key (fallback LLM)
+      - key: GOOGLE_API_KEY
+        sync: false
