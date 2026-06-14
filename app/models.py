@@ -52,3 +52,26 @@ class ForecastResultMessage(BaseModel):
 class ChatBody(BaseModel):
     question: str
     context: dict
+
+
+class CandidateContext(BaseModel):
+    rank: int
+    name: str
+    distance_m: float
+    on_time_rate_pct: float | None = None
+    score: float
+
+
+class RecommendationRequest(BaseModel):
+    delivery_id: str
+    district_id: str
+    anomaly_type: str | None = None
+    anomaly_reason: str | None = None
+    candidates: list[CandidateContext]
+
+
+class RecommendationResponse(BaseModel):
+    recommended_action: str   # Reassign | Contact | Cancel | Monitor
+    candidate_rank: int | None = None   # 1–3, None when action doesn't target a driver
+    reason: str
+    urgency_score: int        # 1–10
