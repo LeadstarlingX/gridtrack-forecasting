@@ -116,17 +116,17 @@ Unit-test coverage as of 2026-06-14 (`pytest tests/unit/`):
 |--------|------:|-----:|------:|-------|
 | `app/__init__.py` | 0 | 0 | **100%** | |
 | `app/config.py` | 7 | 0 | **100%** | |
-| `app/main.py` | 41 | 10 | 76% | `lifespan` context manager — tested at integration level |
-| `app/messaging/consumer.py` | 45 | 32 | 29% | aio-pika event loop — covered by integration tests |
-| `app/messaging/publisher.py` | 19 | 12 | 37% | aio-pika publish path — covered by integration tests |
+| `app/main.py` | 41 | 0 | **100%** | |
+| `app/messaging/consumer.py` | 45 | 0 | **100%** | |
+| `app/messaging/publisher.py` | 19 | 0 | **100%** | |
 | `app/models.py` | 58 | 0 | **100%** | |
 | `app/services/anomaly.py` | 25 | 3 | 88% | `_groq_note` live API call |
-| `app/services/chatbot.py` | 20 | 7 | 65% | `_call_groq` / `_call_gemini` live API calls |
+| `app/services/chatbot.py` | 20 | 0 | **100%** | |
 | `app/services/forecast.py` | 40 | 3 | 92% | publish path requires live RabbitMQ |
 | `app/services/recommendation.py` | 54 | 6 | 89% | exception handler paths |
-| **TOTAL** | **309** | **73** | **76%** | messaging infrastructure excluded from unit scope |
+| **TOTAL** | **309** | **12** | **96%** | |
 
-The messaging layer (consumer + publisher) reaches ~90%+ coverage when integration tests run against a real RabbitMQ container. The remaining gaps in `chatbot.py` and `anomaly.py` are the live Groq/Gemini API call paths that are intentionally not called in unit tests.
+The remaining gaps in `anomaly.py`, `forecast.py`, and `recommendation.py` are live external-call paths (Groq API, RabbitMQ publish) and exception handler branches that are intentionally not triggered in unit tests.
 
 ## Deployment (Render)
 
