@@ -113,7 +113,7 @@ async def test_start_consumer_logs_error_before_retry(mocker, caplog):
 async def _start_consumer_task(mocker, mock_conn):
     """Patch infra, start _run_consumer, wait for ready, return task."""
     mocker.patch("aio_pika.connect_robust", return_value=mock_conn)
-    consumer_mod.ready.clear()
+    consumer_mod.ready = asyncio.Event()
     task = asyncio.create_task(_run_consumer())
     try:
         await asyncio.wait_for(consumer_mod.ready.wait(), timeout=1.0)
@@ -180,7 +180,7 @@ async def test_on_message_dispatches_anomaly_to_score_anomaly(mocker):
         consumer_mod.EXCHANGE_MAP,
         {"gridtrack.anomaly": (DeliveryAnomalyIntegrationEvent, fake_score)},
     )
-    consumer_mod.ready.clear()
+    consumer_mod.ready = asyncio.Event()
     task = asyncio.create_task(_run_consumer())
     await asyncio.wait_for(consumer_mod.ready.wait(), timeout=1.0)
 
@@ -208,7 +208,7 @@ async def test_on_message_publishes_result_when_handler_returns_value(mocker):
         consumer_mod.EXCHANGE_MAP,
         {"gridtrack.anomaly": (DeliveryAnomalyIntegrationEvent, fake_score)},
     )
-    consumer_mod.ready.clear()
+    consumer_mod.ready = asyncio.Event()
     task = asyncio.create_task(_run_consumer())
     await asyncio.wait_for(consumer_mod.ready.wait(), timeout=1.0)
 
@@ -232,7 +232,7 @@ async def test_on_message_skips_publish_when_handler_returns_none(mocker):
         consumer_mod.EXCHANGE_MAP,
         {"gridtrack.anomaly": (DeliveryAnomalyIntegrationEvent, fake_score)},
     )
-    consumer_mod.ready.clear()
+    consumer_mod.ready = asyncio.Event()
     task = asyncio.create_task(_run_consumer())
     await asyncio.wait_for(consumer_mod.ready.wait(), timeout=1.0)
 
@@ -254,7 +254,7 @@ async def test_on_message_handles_invalid_json_without_raising(mocker, caplog):
         consumer_mod.EXCHANGE_MAP,
         {"gridtrack.anomaly": (DeliveryAnomalyIntegrationEvent, fake_score)},
     )
-    consumer_mod.ready.clear()
+    consumer_mod.ready = asyncio.Event()
     task = asyncio.create_task(_run_consumer())
     await asyncio.wait_for(consumer_mod.ready.wait(), timeout=1.0)
 
