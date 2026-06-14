@@ -106,3 +106,66 @@ async def test_ready_returns_200_when_consumer_subscribed(ready_client):
 async def test_ready_rejects_post(client):
     resp = await client.post("/ready")
     assert resp.status_code == 405
+
+
+# ── /recommend ────────────────────────────────────────────────────────────────
+
+_RECOMMEND_BODY = {
+    "delivery_id": "aaaaaaaa-0000-0000-0000-000000000001",
+    "district_id": "mezzeh",
+    "anomaly_type": "EtaExceeded",
+    "anomaly_reason": "Driver stalled for 20 minutes",
+    "candidates": [
+        {"rank": 1, "name": "Ahmad Hassan", "distance_m": 250, "on_time_rate_pct": 0.85, "score": 0.82},
+        {"rank": 2, "name": "Mohamed Ali",  "distance_m": 800, "on_time_rate_pct": 0.60, "score": 0.65},
+    ],
+}
+
+_VALID_LLM_JSON = '{"recommended_action": "Reassign", "candidate_rank": 1, "reason": "Closest driver with best on-time rate.", "urgency_score": 7}'
+
+
+async def test_recommend_returns_structured_response(client, mocker):
+    mocker.patch("app.services.recommendation.call_llm", return_value=_VALID_LLM_JSON)
+    resp = await client.post("/recommend", json=_RECOMMEND_BODY)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["recommended_action"] == "Reassign"
+    assert data["candidate_rank"] == 1
+    assert data["urgency_score"] == 7
+    assert "reason" in data
+
+
+async def test_recommend_accepts_llm_with_markdown_fences(client, mocker):
+    mocker.patch(
+        "app.services.recommendation.call_llm",
+        return_value=f"```json\n{_VALID_LLM_JSON}\n```",
+    )
+    resp = await client.post("/recommend", json=_RECOMMEND_BODY)
+    assert resp.status_code == 200
+    assert resp.json()["recommended_action"] == "Reassign"
+
+
+async def test_recommend_falls_back_to_monitor_on_garbage_llm_output(client, mocker):
+    mocker.patch("app.services.recommendation.call_llm", return_value="I cannot decide.")
+    resp = await client.post("/recommend", json=_RECOMMEND_BODY)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["recommended_action"] == "Monitor"
+    assert data["candidate_rank"] is None
+
+
+async def test_recommend_missing_delivery_id_returns_422(client):
+    body = {k: v for k, v in _RECOMMEND_BODY.items() if k != "delivery_id"}
+    resp = await client.post("/recommend", json=body)
+    assert resp.status_code == 422
+
+
+async def test_recommend_no_candidates_still_valid(client, mocker):
+    mocker.patch(
+        "app.services.recommendation.call_llm",
+        return_value='{"recommended_action": "Monitor", "candidate_rank": null, "reason": "No drivers.", "urgency_score": 6}',
+    )
+    body = {**_RECOMMEND_BODY, "candidates": []}
+    resp = await client.post("/recommend", json=body)
+    assert resp.status_code == 200
+    assert resp.json()["recommended_action"] == "Monitor"
