@@ -7,8 +7,9 @@ from fastapi import FastAPI, HTTPException
 
 from app.messaging import consumer as _consumer
 from app.messaging.consumer import start_consumer
-from app.models import ChatBody
+from app.models import ChatBody, RecommendationRequest, RecommendationResponse
 from app.services.chatbot import call_llm
+from app.services.recommendation import get_recommendation
 
 logger = logging.getLogger(__name__)
 _consumer_task: asyncio.Task | None = None
@@ -42,6 +43,11 @@ async def ready():
     if not _consumer.ready.is_set():
         raise HTTPException(status_code=503, detail="Consumer not yet connected to RabbitMQ")
     return {"status": "ready"}
+
+
+@app.post("/recommend", response_model=RecommendationResponse)
+async def recommend(body: RecommendationRequest) -> RecommendationResponse:
+    return await get_recommendation(body)
 
 
 @app.post("/chat")

@@ -1,6 +1,6 @@
 # GridTrack Forecasting Service
 
-Standalone Python microservice for the GridTrack delivery-monitoring system. Handles urgency scoring, district demand forecasting, and AI chatbot queries.
+Standalone Python microservice for the GridTrack delivery-monitoring system. Handles urgency scoring, district demand forecasting, AI dispatch recommendations, and AI chatbot queries.
 
 ## Architecture
 
@@ -18,8 +18,9 @@ Standalone Python microservice for the GridTrack delivery-monitoring system. Han
         │  ── gridtrack.urgency-results   →  .NET broadcasts via SignalR
         │  ── gridtrack.forecast-results  →  .NET broadcasts via SignalR
         │
-        │  HTTP (called synchronously by .NET proxy controller)
-        └─ POST /chat   →  AI chatbot answer  →  .NET returns to browser
+        │  HTTP (called synchronously by .NET proxy)
+        ├─ POST /chat      →  AI chatbot answer  →  .NET returns to browser
+        └─ POST /recommend →  structured dispatch recommendation  →  .NET delivery drawer
 ```
 
 ## Tech Stack
@@ -84,18 +85,48 @@ uvicorn app.main:app --reload --port 8000
 
 The service starts and logs `Consumer ready — waiting for messages`. Endpoints:
 
-- `GET  http://localhost:8000/health`
-- `POST http://localhost:8000/chat`
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/health` | Liveness probe → `{"status":"ok"}` |
+| `GET`  | `/ready` | Readiness probe — 503 until RabbitMQ consumer is connected |
+| `POST` | `/chat` | AI chatbot: `{question, context}` → `{answer}` |
+| `POST` | `/recommend` | Dispatch recommendation: delivery context + top-3 driver candidates → `{recommended_action, candidate_rank, reason, urgency_score}` |
 
 ## Testing
 
 ```bash
-# Unit tests (no infrastructure needed)
-pytest tests/unit/ -v
+# Unit tests with coverage (no infrastructure needed)
+pytest tests/unit/
 
-# Integration tests (requires Docker)
-pytest tests/integration/ -v
+# Integration tests (requires Docker for RabbitMQ)
+pytest tests/integration/ --no-cov -v
 ```
+
+Coverage runs automatically on every `pytest tests/unit/` invocation (configured in `pytest.ini`). To generate an HTML report:
+
+```bash
+pytest tests/unit/ --cov-report=html
+```
+
+## Coverage
+
+Unit-test coverage as of 2026-06-14 (`pytest tests/unit/`):
+
+| Module | Stmts | Miss | Cover | Notes |
+|--------|------:|-----:|------:|-------|
+| `app/__init__.py` | 0 | 0 | **100%** | |
+| `app/config.py` | 7 | 0 | **100%** | |
+| `app/main.py` | 41 | 10 | 76% | `lifespan` context manager — tested at integration level |
+| `app/messaging/consumer.py` | 45 | 32 | 29% | aio-pika event loop — covered by integration tests |
+| `app/messaging/publisher.py` | 19 | 12 | 37% | aio-pika publish path — covered by integration tests |
+| `app/models.py` | 58 | 0 | **100%** | |
+| `app/services/anomaly.py` | 25 | 3 | 88% | `_groq_note` live API call |
+| `app/services/chatbot.py` | 20 | 7 | 65% | `_call_groq` / `_call_gemini` live API calls |
+| `app/services/forecast.py` | 40 | 3 | 92% | publish path requires live RabbitMQ |
+| `app/services/recommendation.py` | 54 | 6 | 89% | exception handler paths |
+| **TOTAL** | **309** | **73** | **76%** | messaging infrastructure excluded from unit scope |
+
+The messaging layer (consumer + publisher) reaches ~90%+ coverage when integration tests run against a real RabbitMQ container. The remaining gaps in `chatbot.py` and `anomaly.py` are the live Groq/Gemini API call paths that are intentionally not called in unit tests.
 
 ## Deployment (Render)
 

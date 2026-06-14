@@ -17,6 +17,8 @@ bugs_notes.md
 .pytest_cache/
 htmlcov/
 .coverage
+coverage.json
+coverage.xml
 
 # IDE
 .vscode/
