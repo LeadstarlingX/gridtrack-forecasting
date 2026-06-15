@@ -75,3 +75,34 @@ class RecommendationResponse(BaseModel):
     candidate_rank: int | None = None   # 1–3, None when action doesn't target a driver
     reason: str
     urgency_score: int        # 1–10
+
+
+class DemandSurgeMessage(BaseModel):
+    districtId: str
+    currentCount: int
+    historicalMean: float
+    deviations: float          # z-score above baseline
+    detectedAt: str
+
+
+class AnomalyIncidentMessage(BaseModel):
+    districtId: str
+    anomalyCount: int
+    windowMinutes: int
+    summary: str               # Groq-generated one-liner
+    detectedAt: str
+
+
+class StaffingRequest(BaseModel):
+    district: str
+    target_datetime: str       # ISO string
+    day_of_week: int           # 0=Mon … 6=Sun
+    target_hour: int           # 0–23
+    historical_avg_deliveries: float
+    recent_surge_detected: bool
+
+
+class StaffingResponse(BaseModel):
+    recommended_drivers: int
+    confidence: str            # "high" | "medium" | "low"
+    reasoning: str
