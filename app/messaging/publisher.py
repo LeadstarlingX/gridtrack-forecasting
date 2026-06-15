@@ -6,16 +6,20 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 _QUEUE_MAP: dict[str, str] = {
-    "UrgencyResultMessage":  "gridtrack.urgency-results",
-    "ForecastResultMessage": "gridtrack.forecast-results",
+    "UrgencyResultMessage":    "gridtrack.urgency-results",
+    "ForecastResultMessage":   "gridtrack.forecast-results",
+    "DemandSurgeMessage":      "gridtrack.demand-surge",
+    "AnomalyIncidentMessage":  "gridtrack.anomaly-incidents",
 }
 
 # Wolverine identifies message types by their full .NET type name, lowercased.
 # Format: "{namespace}.{classname}" — must match the C# type exactly.
 # See: GridTrack.Application.IntegrationEvents in the .NET backend.
 _MESSAGE_TYPE_HEADERS: dict[str, str] = {
-    "UrgencyResultMessage":  "gridtrack.application.integrationevents.urgencyresultmessage",
-    "ForecastResultMessage": "gridtrack.application.integrationevents.forecastresultmessage",
+    "UrgencyResultMessage":    "gridtrack.application.integrationevents.urgencyresultmessage",
+    "ForecastResultMessage":   "gridtrack.application.integrationevents.forecastresultmessage",
+    "DemandSurgeMessage":      "gridtrack.application.integrationevents.demandsurgemessage",
+    "AnomalyIncidentMessage":  "gridtrack.application.integrationevents.anomalyincidentmessage",
 }
 
 

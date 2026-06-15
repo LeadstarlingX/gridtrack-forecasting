@@ -1,7 +1,9 @@
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import aio_pika
+from pydantic import BaseModel
 
 from app.config import settings
 from app.messaging.publisher import publish
@@ -13,6 +15,8 @@ from app.models import (
 from app.services.anomaly import score_anomaly
 from app.services.completion import handle_completion
 from app.services.forecast import update_forecast
+from app.services.incident import check_incident
+from app.services.surge import check_surge
 
 # Set once all exchanges are declared and queues are bound.
 # Polled by the /ready endpoint so the test factory waits before sending events.
@@ -20,10 +24,36 @@ ready = asyncio.Event()
 
 logger = logging.getLogger(__name__)
 
+
+# ── Composite handlers ───────────────────────────────────────────────────────
+
+async def handle_position(event: DriverPositionIntegrationEvent) -> list[BaseModel]:
+    """Runs forecast + surge detection; returns 0-2 results."""
+    results: list[BaseModel] = []
+    forecast = await update_forecast(event)
+    if forecast is not None:
+        results.append(forecast)
+        now   = datetime.now(timezone.utc)
+        surge = check_surge(event.districtId, forecast.expectedDeliveries, now)
+        if surge is not None:
+            results.append(surge)
+    return results
+
+
+async def handle_anomaly(event: DeliveryAnomalyIntegrationEvent) -> list[BaseModel]:
+    """Scores urgency + checks for incident threshold; returns 1-2 results."""
+    urgency  = await score_anomaly(event)
+    incident = await check_incident(event)
+    results: list[BaseModel] = [urgency]
+    if incident is not None:
+        results.append(incident)
+    return results
+
+
 EXCHANGE_MAP = {
-    "gridtrack.anomaly":      (DeliveryAnomalyIntegrationEvent,    score_anomaly),
-    "gridtrack.positions":    (DriverPositionIntegrationEvent,      update_forecast),
-    "gridtrack.completions":  (DeliveryCompletedIntegrationEvent,   handle_completion),
+    "gridtrack.anomaly":      (DeliveryAnomalyIntegrationEvent,   handle_anomaly),
+    "gridtrack.positions":    (DriverPositionIntegrationEvent,     handle_position),
+    "gridtrack.completions":  (DeliveryCompletedIntegrationEvent,  handle_completion),
 }
 
 
@@ -65,9 +95,14 @@ async def _run_consumer() -> None:
                         event = _schema.model_validate_json(msg.body)
                         logger.info("Received %s", _schema.__name__)
                         result = await _handler(event)
-                        if result is not None:
-                            logger.info("Publishing %s", type(result).__name__)
-                            await publish(channel, result)
+                        # Handlers may return None, a single BaseModel, or a list.
+                        if result is None:
+                            return
+                        items = result if isinstance(result, list) else [result]
+                        for item in items:
+                            if item is not None:
+                                logger.info("Publishing %s", type(item).__name__)
+                                await publish(channel, item)
                     except Exception as exc:
                         logger.error("Error processing message: %s", exc)
 
