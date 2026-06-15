@@ -61,6 +61,10 @@ async def update_forecast(
     )
 
 
+def release_driver(district: str, driver_id: str) -> None:
+    _active_drivers[district].discard(driver_id)
+
+
 def _should_emit(district: str, now: datetime) -> bool:
     last = _last_emit.get(district)
     if last is None or (now - last) >= EMIT_INTERVAL:

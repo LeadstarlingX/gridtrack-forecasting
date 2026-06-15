@@ -7,9 +7,11 @@ from app.config import settings
 from app.messaging.publisher import publish
 from app.models import (
     DeliveryAnomalyIntegrationEvent,
+    DeliveryCompletedIntegrationEvent,
     DriverPositionIntegrationEvent,
 )
 from app.services.anomaly import score_anomaly
+from app.services.completion import handle_completion
 from app.services.forecast import update_forecast
 
 # Set once all exchanges are declared and queues are bound.
@@ -19,8 +21,9 @@ ready = asyncio.Event()
 logger = logging.getLogger(__name__)
 
 EXCHANGE_MAP = {
-    "gridtrack.anomaly":   (DeliveryAnomalyIntegrationEvent, score_anomaly),
-    "gridtrack.positions": (DriverPositionIntegrationEvent,  update_forecast),
+    "gridtrack.anomaly":      (DeliveryAnomalyIntegrationEvent,    score_anomaly),
+    "gridtrack.positions":    (DriverPositionIntegrationEvent,      update_forecast),
+    "gridtrack.completions":  (DeliveryCompletedIntegrationEvent,   handle_completion),
 }
 
 
