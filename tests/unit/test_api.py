@@ -169,3 +169,204 @@ async def test_recommend_no_candidates_still_valid(client, mocker):
     resp = await client.post("/recommend", json=body)
     assert resp.status_code == 200
     assert resp.json()["recommended_action"] == "Monitor"
+
+
+# ── /staffing ─────────────────────────────────────────────────────────────────
+
+_STAFFING_BODY = {
+    "district": "mezzeh",
+    "target_datetime": "2026-06-15T09:00:00Z",
+    "day_of_week": 6,
+    "target_hour": 9,
+    "historical_avg_deliveries": 12.0,
+    "recent_surge_detected": False,
+}
+
+_VALID_STAFFING_JSON = (
+    '{"recommended_drivers": 4, "confidence": "high", '
+    '"reasoning": "Historical avg of 12 suggests 4 drivers."}'
+)
+
+
+async def test_staffing_returns_structured_response(client, mocker):
+    mocker.patch("app.services.staffing._call_groq", return_value=_VALID_STAFFING_JSON)
+    resp = await client.post("/staffing", json=_STAFFING_BODY)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["recommended_drivers"] == 4
+    assert data["confidence"] == "high"
+    assert "reasoning" in data
+
+
+async def test_staffing_missing_district_returns_422(client):
+    body = {k: v for k, v in _STAFFING_BODY.items() if k != "district"}
+    resp = await client.post("/staffing", json=body)
+    assert resp.status_code == 422
+
+
+async def test_staffing_missing_target_hour_returns_422(client):
+    body = {k: v for k, v in _STAFFING_BODY.items() if k != "target_hour"}
+    resp = await client.post("/staffing", json=body)
+    assert resp.status_code == 422
+
+
+async def test_staffing_groq_failure_falls_back_to_safe_default(client, mocker):
+    mocker.patch("app.services.staffing._call_groq", side_effect=RuntimeError("Groq down"))
+    resp = await client.post("/staffing", json=_STAFFING_BODY)
+    assert resp.status_code == 200
+    data = resp.json()
+    # safe_default: max(1, round(12.0 / 3)) = 4
+    assert data["recommended_drivers"] == 4
+    assert data["confidence"] == "low"
+    assert "AI unavailable" in data["reasoning"]
+
+
+async def test_staffing_llm_returns_zero_drivers_clamped_to_one(client, mocker):
+    mocker.patch(
+        "app.services.staffing._call_groq",
+        return_value='{"recommended_drivers": 0, "confidence": "medium", "reasoning": "No demand."}',
+    )
+    body = {**_STAFFING_BODY, "historical_avg_deliveries": 0.5}
+    resp = await client.post("/staffing", json=body)
+    assert resp.status_code == 200
+    assert resp.json()["recommended_drivers"] >= 1
+
+
+async def test_staffing_surge_flag_accepted(client, mocker):
+    mocker.patch("app.services.staffing._call_groq", return_value=_VALID_STAFFING_JSON)
+    resp = await client.post("/staffing", json={**_STAFFING_BODY, "recent_surge_detected": True})
+    assert resp.status_code == 200
+    assert resp.json()["recommended_drivers"] == 4
+
+
+async def test_staffing_garbage_llm_json_returns_parse_fallback(client, mocker):
+    mocker.patch("app.services.staffing._call_groq", return_value="not json at all")
+    resp = await client.post("/staffing", json=_STAFFING_BODY)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["recommended_drivers"] >= 1
+    assert data["confidence"] == "low"
+
+
+async def test_staffing_markdown_fenced_json_is_accepted(client, mocker):
+    mocker.patch(
+        "app.services.staffing._call_groq",
+        return_value=f"```json\n{_VALID_STAFFING_JSON}\n```",
+    )
+    resp = await client.post("/staffing", json=_STAFFING_BODY)
+    assert resp.status_code == 200
+    assert resp.json()["recommended_drivers"] == 4
+
+
+# ── /chat/stream ──────────────────────────────────────────────────────────────
+
+
+async def test_chat_stream_post_returns_sse_content_type(client, mocker):
+    async def fake_stream(_prompt: str):
+        yield "hello"
+
+    mocker.patch("app.main.stream_llm", side_effect=fake_stream)
+    resp = await client.post(
+        "/chat/stream",
+        json={"question": "How many deliveries?", "context": {}},
+    )
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+
+
+async def test_chat_stream_post_emits_token_events_and_done(client, mocker):
+    async def fake_stream(_prompt: str):
+        for token in ["Hello", " world"]:
+            yield token
+
+    mocker.patch("app.main.stream_llm", side_effect=fake_stream)
+    resp = await client.post(
+        "/chat/stream",
+        json={"question": "Test", "context": {"district": "mezzeh"}},
+    )
+    assert resp.status_code == 200
+    body = resp.text
+    assert 'data: {"token": "Hello"}' in body
+    assert 'data: {"token": " world"}' in body
+    assert "data: [DONE]" in body
+
+
+async def test_chat_stream_get_returns_sse_via_query_params(client, mocker):
+    async def fake_stream(_prompt: str):
+        yield "ok"
+
+    mocker.patch("app.main.stream_llm", side_effect=fake_stream)
+    resp = await client.get("/chat/stream?question=test&context=%7B%7D")
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+    assert "data: [DONE]" in resp.text
+
+
+async def test_chat_stream_done_terminator_present_after_error(client, mocker):
+    async def failing_stream(_prompt: str):
+        yield "partial"
+        raise RuntimeError("Network error mid-stream")
+
+    mocker.patch("app.main.stream_llm", side_effect=failing_stream)
+    resp = await client.post(
+        "/chat/stream",
+        json={"question": "Fail halfway", "context": {}},
+    )
+    assert resp.status_code == 200
+    assert "data: [DONE]" in resp.text
+
+
+async def test_chat_stream_missing_question_returns_422(client):
+    resp = await client.post("/chat/stream", json={"context": {}})
+    assert resp.status_code == 422
+
+
+# ── /transcribe ───────────────────────────────────────────────────────────────
+
+
+async def test_transcribe_returns_text(client, mocker):
+    mock_groq = mocker.MagicMock()
+    mock_groq.audio.transcriptions.create = mocker.AsyncMock(
+        return_value=mocker.MagicMock(text="hello world")
+    )
+    mocker.patch("groq.AsyncGroq", return_value=mock_groq)
+
+    resp = await client.post(
+        "/transcribe",
+        files={"file": ("audio.webm", b"fake audio bytes", "audio/webm")},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["text"] == "hello world"
+
+
+async def test_transcribe_passes_filename_to_groq(client, mocker):
+    mock_groq = mocker.MagicMock()
+    create_mock = mocker.AsyncMock(return_value=mocker.MagicMock(text="ok"))
+    mock_groq.audio.transcriptions.create = create_mock
+    mocker.patch("groq.AsyncGroq", return_value=mock_groq)
+
+    await client.post(
+        "/transcribe",
+        files={"file": ("my_recording.wav", b"data", "audio/wav")},
+    )
+    call_kwargs = create_mock.call_args.kwargs
+    assert call_kwargs["file"][0] == "my_recording.wav"
+
+
+async def test_transcribe_groq_failure_returns_503(client, mocker):
+    mock_groq = mocker.MagicMock()
+    mock_groq.audio.transcriptions.create = mocker.AsyncMock(
+        side_effect=RuntimeError("Whisper unavailable")
+    )
+    mocker.patch("groq.AsyncGroq", return_value=mock_groq)
+
+    resp = await client.post(
+        "/transcribe",
+        files={"file": ("audio.webm", b"data", "audio/webm")},
+    )
+    assert resp.status_code == 503
+
+
+async def test_transcribe_missing_file_returns_422(client):
+    resp = await client.post("/transcribe")
+    assert resp.status_code == 422

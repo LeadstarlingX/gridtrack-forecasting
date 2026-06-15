@@ -13,7 +13,7 @@ Run with:
 """
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import aio_pika
@@ -493,3 +493,289 @@ async def test_score_table_all_anomaly_types_and_districts(running_consumer, rab
         assert got == expected, (
             f"{anomaly_type} in {district}: expected urgencyScore={expected}, got={got}"
         )
+
+
+# ── Demand Surge tests ────────────────────────────────────────────────────────
+
+
+async def test_position_burst_triggers_demand_surge(running_consumer, rabbitmq_url):
+    """
+    Pre-seed forecast window and surge baseline so one position event triggers
+    a statistical surge. Consumer must publish DemandSurgeMessage to
+    gridtrack.demand-surge.
+
+    Strategy: populate _windows with 20 recent timestamps (simulates prior
+    position events without going through RabbitMQ) so the first real event
+    causes a forecast emit with expectedDeliveries≈40, far above the seeded
+    baseline of [2,2,2,2,2] → z >> 2.0.
+    """
+    import app.services.forecast as forecast_svc
+    import app.services.surge as surge_svc
+
+    setup_channel, _, _ = running_consumer
+    surge_q = await setup_channel.declare_queue("gridtrack.demand-surge", durable=True)
+    await surge_q.purge()
+
+    now = datetime.now(timezone.utc)
+    district = "surgetestdistrict"
+
+    for i in range(20):
+        forecast_svc._windows[district].append(now - timedelta(seconds=i * 2))
+    surge_svc._history[district].extend([2, 2, 2, 2, 2])
+
+    event = DriverPositionIntegrationEvent(
+        driverId=uuid4(),
+        districtId=district,
+        lat=33.505,
+        lng=36.243,
+        deliveryStatus="InTransit",
+        timestamp=now,
+    )
+    await _publish(rabbitmq_url, "gridtrack.positions", event.model_dump_json().encode())
+
+    msg = await _wait_for_message(surge_q)
+    payload = json.loads(msg.body)
+
+    assert payload["districtId"] == district
+    assert payload["currentCount"] > 0
+    assert payload["deviations"] >= 2.0
+
+
+async def test_demand_surge_message_matches_dotnet_contract(running_consumer, rabbitmq_url):
+    """
+    Field names, types, and value ranges of DemandSurgeMessage must exactly
+    match what Wolverine deserializes as DemandSurgeMessage on the .NET side.
+    """
+    import app.services.forecast as forecast_svc
+    import app.services.surge as surge_svc
+
+    setup_channel, _, _ = running_consumer
+    surge_q = await setup_channel.declare_queue("gridtrack.demand-surge", durable=True)
+    await surge_q.purge()
+
+    now = datetime.now(timezone.utc)
+    district = "contractsurgedistrict"
+
+    for i in range(20):
+        forecast_svc._windows[district].append(now - timedelta(seconds=i))
+    surge_svc._history[district].extend([1, 1, 1, 1, 1])
+
+    event = DriverPositionIntegrationEvent(
+        driverId=uuid4(),
+        districtId=district,
+        lat=33.51,
+        lng=36.25,
+        deliveryStatus="InTransit",
+        timestamp=now,
+    )
+    await _publish(rabbitmq_url, "gridtrack.positions", event.model_dump_json().encode())
+
+    msg = await _wait_for_message(surge_q)
+    payload = json.loads(msg.body)
+
+    assert set(payload.keys()) == {
+        "districtId", "currentCount", "historicalMean", "deviations", "detectedAt"
+    }
+    assert isinstance(payload["districtId"], str)
+    assert isinstance(payload["currentCount"], int)
+    assert isinstance(payload["historicalMean"], float)
+    assert isinstance(payload["deviations"], float)
+    assert payload["detectedAt"]  # non-empty ISO string
+
+
+async def test_surge_cooldown_suppresses_second_alert(running_consumer, rabbitmq_url):
+    """
+    A second position burst for the same district within 15 min must NOT
+    produce a second DemandSurgeMessage (cooldown guard).
+    """
+    import app.services.forecast as forecast_svc
+    import app.services.surge as surge_svc
+
+    setup_channel, _, _ = running_consumer
+    surge_q = await setup_channel.declare_queue("gridtrack.demand-surge", durable=True)
+    await surge_q.purge()
+
+    now = datetime.now(timezone.utc)
+    district = "cooldowndistrict"
+
+    # First burst — triggers surge
+    for i in range(20):
+        forecast_svc._windows[district].append(now - timedelta(seconds=i))
+    surge_svc._history[district].extend([1, 1, 1, 1, 1])
+
+    event = DriverPositionIntegrationEvent(
+        driverId=uuid4(), districtId=district, lat=33.505, lng=36.243,
+        deliveryStatus="InTransit", timestamp=now,
+    )
+    await _publish(rabbitmq_url, "gridtrack.positions", event.model_dump_json().encode())
+
+    first = await _wait_for_message(surge_q)
+    assert json.loads(first.body)["districtId"] == district
+
+    # Reset forecast throttle so a second emit is possible, but surge cooldown remains
+    forecast_svc._last_emit.pop(district, None)
+    for i in range(20):
+        forecast_svc._windows[district].append(now - timedelta(seconds=i))
+
+    event2 = DriverPositionIntegrationEvent(
+        driverId=uuid4(), districtId=district, lat=33.505, lng=36.243,
+        deliveryStatus="InTransit", timestamp=now,
+    )
+    await _publish(rabbitmq_url, "gridtrack.positions", event2.model_dump_json().encode())
+
+    await asyncio.sleep(2.0)
+    try:
+        await _wait_for_message(surge_q, timeout=0.5)
+        pytest.fail("A second surge was emitted — cooldown did not suppress it")
+    except TimeoutError:
+        pass  # Correct: cooldown in effect
+
+
+# ── Anomaly Incident tests ────────────────────────────────────────────────────
+
+
+async def test_anomaly_burst_triggers_incident(running_consumer, rabbitmq_url, mocker):
+    """
+    Three anomaly events in the same district within the 30-minute window must
+    trigger an AnomalyIncidentMessage on gridtrack.anomaly-incidents.
+    """
+    mocker.patch(
+        "app.services.incident._groq_summary",
+        return_value="3 stalls detected — check district drivers",
+    )
+
+    setup_channel, _, _ = running_consumer
+    incident_q = await setup_channel.declare_queue("gridtrack.anomaly-incidents", durable=True)
+    await incident_q.purge()
+
+    district = "incidenttestdistrict"
+    for anomaly_type in ("StalePosition", "RouteDeviation", "UnexpectedStop"):
+        event = DeliveryAnomalyIntegrationEvent(
+            deliveryId=uuid4(),
+            districtId=district,
+            anomalyType=anomaly_type,
+            reason="Integration test anomaly",
+            driverLat=33.505,
+            driverLng=36.243,
+            occurredAt=datetime.now(timezone.utc),
+        )
+        await _publish(rabbitmq_url, "gridtrack.anomaly", event.model_dump_json().encode())
+
+    msg = await _wait_for_message(incident_q, timeout=15.0)
+    payload = json.loads(msg.body)
+
+    assert payload["districtId"] == district
+    assert payload["anomalyCount"] >= 3
+    assert payload["windowMinutes"] == 30
+    assert payload["summary"] == "3 stalls detected — check district drivers"
+
+
+async def test_anomaly_incident_message_matches_dotnet_contract(running_consumer, rabbitmq_url, mocker):
+    """
+    AnomalyIncidentMessage field names and types must exactly match what
+    Wolverine deserializes as AnomalyIncidentMessage on the .NET side.
+    """
+    mocker.patch(
+        "app.services.incident._groq_summary",
+        return_value="Multiple anomalies — manual review needed",
+    )
+
+    setup_channel, _, _ = running_consumer
+    incident_q = await setup_channel.declare_queue("gridtrack.anomaly-incidents", durable=True)
+    await incident_q.purge()
+
+    district = "contractincidentdistrict"
+    for _ in range(3):
+        event = DeliveryAnomalyIntegrationEvent(
+            deliveryId=uuid4(),
+            districtId=district,
+            anomalyType="EtaExceeded",
+            reason="Contract test",
+            driverLat=33.505,
+            driverLng=36.243,
+            occurredAt=datetime.now(timezone.utc),
+        )
+        await _publish(rabbitmq_url, "gridtrack.anomaly", event.model_dump_json().encode())
+
+    msg = await _wait_for_message(incident_q, timeout=15.0)
+    payload = json.loads(msg.body)
+
+    assert set(payload.keys()) == {
+        "districtId", "anomalyCount", "windowMinutes", "summary", "detectedAt"
+    }
+    assert isinstance(payload["districtId"], str)
+    assert isinstance(payload["anomalyCount"], int)
+    assert isinstance(payload["windowMinutes"], int)
+    assert isinstance(payload["summary"], str)
+    assert payload["detectedAt"]  # non-empty ISO string
+
+
+async def test_incident_groq_failure_uses_fallback_summary(running_consumer, rabbitmq_url, mocker):
+    """
+    When Groq fails during incident summarisation, the consumer must still
+    publish an AnomalyIncidentMessage with the hard-coded fallback rather
+    than crashing or dropping the message.
+    """
+    mocker.patch(
+        "app.services.incident._groq_summary",
+        side_effect=RuntimeError("Groq API unreachable"),
+    )
+
+    setup_channel, _, _ = running_consumer
+    incident_q = await setup_channel.declare_queue("gridtrack.anomaly-incidents", durable=True)
+    await incident_q.purge()
+
+    district = "fallbackincidentdistrict"
+    for _ in range(3):
+        event = DeliveryAnomalyIntegrationEvent(
+            deliveryId=uuid4(),
+            districtId=district,
+            anomalyType="StalePosition",
+            reason="Fallback test",
+            driverLat=33.505,
+            driverLng=36.243,
+            occurredAt=datetime.now(timezone.utc),
+        )
+        await _publish(rabbitmq_url, "gridtrack.anomaly", event.model_dump_json().encode())
+
+    msg = await _wait_for_message(incident_q, timeout=15.0)
+    payload = json.loads(msg.body)
+
+    assert payload["districtId"] == district
+    assert "manual review" in payload["summary"].lower()
+
+
+async def test_below_threshold_anomalies_produce_no_incident(running_consumer, rabbitmq_url, mocker):
+    """
+    Two anomaly events (below the 3-event threshold) must NOT produce an
+    AnomalyIncidentMessage.
+    """
+    mocker.patch("app.services.incident._groq_summary", return_value="should not be called")
+
+    setup_channel, urgency_q, _ = running_consumer
+    incident_q = await setup_channel.declare_queue("gridtrack.anomaly-incidents", durable=True)
+    await incident_q.purge()
+
+    district = "belowthresholddistrict"
+    for _ in range(2):
+        event = DeliveryAnomalyIntegrationEvent(
+            deliveryId=uuid4(),
+            districtId=district,
+            anomalyType="EtaExceeded",
+            reason="Sub-threshold test",
+            driverLat=33.505,
+            driverLng=36.243,
+            occurredAt=datetime.now(timezone.utc),
+        )
+        await _publish(rabbitmq_url, "gridtrack.anomaly", event.model_dump_json().encode())
+
+    # Wait for the 2 urgency results to arrive (consumer processed the events)
+    for _ in range(2):
+        await _wait_for_message(urgency_q)
+
+    # No incident should have been published
+    try:
+        await _wait_for_message(incident_q, timeout=1.0)
+        pytest.fail("An incident was emitted for only 2 anomalies — threshold not enforced")
+    except TimeoutError:
+        pass  # Correct: below threshold, no incident
