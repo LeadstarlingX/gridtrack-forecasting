@@ -1,4 +1,18 @@
+"""LLM chat service.
+
+Primary: Groq llama-3.3-70b-versatile.
+Fallback: Gemini Flash (if Groq fails).
+
+Exposes:
+  call_llm(prompt)              — non-streaming, returns full string
+  stream_llm(prompt)            — async generator of token strings
+  call_llm_with_tools(prompt)   — tool-calling loop, uses in-memory forecast state
+"""
+
+import json
 import logging
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from groq import AsyncGroq
 
@@ -6,11 +20,80 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-_groq = AsyncGroq(api_key=settings.groq_api_key)
+_groq         = AsyncGroq(api_key=settings.groq_api_key)
+_FAST_MODEL   = "llama-3.1-8b-instant"       # urgency notes, short tasks
+_QUALITY_MODEL = "llama-3.3-70b-versatile"   # chatbot, tools, incidents, staffing
 
+# ── Tools available to the chatbot ──────────────────────────────────────────
+
+_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_district_activity",
+            "description": (
+                "Returns the current real-time activity for a specific district: "
+                "how many position events arrived in the last hour and how many "
+                "unique drivers are currently active."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "district_id": {
+                        "type": "string",
+                        "description": "District identifier, e.g. 'mezzeh' or 'kafrsousa'",
+                    }
+                },
+                "required": ["district_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_all_districts_summary",
+            "description": (
+                "Returns a summary of ALL known districts: position events in the "
+                "last hour and active driver count for each. Use this when the "
+                "question is about comparing districts or asking about the overall fleet."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+
+def _run_tool(name: str, args: dict[str, Any]) -> str:
+    from datetime import datetime, timedelta, timezone
+    from app.services.forecast import _windows, _active_drivers  # live in-memory state
+
+    now    = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=1)
+
+    if name == "get_district_activity":
+        d       = args.get("district_id", "")
+        window  = _windows.get(d)
+        count   = sum(1 for t in (window or []) if t >= cutoff)
+        drivers = len(_active_drivers.get(d, set()))
+        return json.dumps({"district": d, "position_events_last_hour": count, "active_drivers": drivers})
+
+    if name == "get_all_districts_summary":
+        districts = set(_windows.keys()) | set(_active_drivers.keys())
+        summary   = []
+        for d in sorted(districts):
+            window  = _windows.get(d)
+            count   = sum(1 for t in (window or []) if t >= cutoff)
+            drivers = len(_active_drivers.get(d, set()))
+            summary.append({"district": d, "events_last_hour": count, "active_drivers": drivers})
+        return json.dumps(summary)
+
+    return json.dumps({"error": f"Unknown tool: {name}"})
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
 
 async def call_llm(prompt: str) -> str:
-    """Call Groq (primary). Falls back to Gemini Flash on any error."""
+    """Non-streaming call. Groq primary, Gemini fallback."""
     try:
         return await _call_groq(prompt)
     except Exception as exc:
@@ -18,11 +101,81 @@ async def call_llm(prompt: str) -> str:
         return await _call_gemini(prompt)
 
 
+async def call_llm_fast(prompt: str) -> str:
+    """Fast / cheap model for short structured outputs (urgency notes etc.)."""
+    try:
+        resp = await _groq.chat.completions.create(
+            model=_FAST_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=60,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        logger.warning("Fast Groq failed (%s), falling back to quality model", exc)
+        return await _call_groq(prompt)
+
+
+async def stream_llm(prompt: str) -> AsyncGenerator[str, None]:
+    """Streaming generator — yields token strings. Falls back to single chunk on error."""
+    try:
+        stream = await _groq.chat.completions.create(
+            model=_QUALITY_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+            max_tokens=400,
+        )
+        async for chunk in stream:
+            token = chunk.choices[0].delta.content
+            if token:
+                yield token
+    except Exception as exc:
+        logger.warning("Groq streaming failed (%s), falling back", exc)
+        result = await _call_gemini(prompt)
+        yield result
+
+
+async def call_llm_with_tools(prompt: str) -> str:
+    """Tool-calling loop. Groq asks for live district data via tools, then synthesises."""
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+
+    for _ in range(5):
+        resp = await _groq.chat.completions.create(
+            model=_QUALITY_MODEL,
+            messages=messages,
+            tools=_TOOLS,
+            tool_choice="auto",
+            max_tokens=500,
+        )
+        msg = resp.choices[0].message
+
+        if not msg.tool_calls:
+            return (msg.content or "").strip()
+
+        tool_calls_payload: list[dict[str, Any]] = [
+            {
+                "id":       tc.id,
+                "type":     "function",
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+            }
+            for tc in msg.tool_calls
+        ]
+        messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls_payload})
+
+        for tc in msg.tool_calls:
+            args   = json.loads(tc.function.arguments or "{}")
+            result = _run_tool(tc.function.name, args)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    return (msg.content or "").strip()
+
+
+# ── Private helpers ──────────────────────────────────────────────────────────
+
 async def _call_groq(prompt: str) -> str:
     resp = await _groq.chat.completions.create(
-        model="llama3-8b-8192",
+        model=_QUALITY_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=200,
+        max_tokens=400,
     )
     return resp.choices[0].message.content.strip()
 
@@ -32,5 +185,5 @@ async def _call_gemini(prompt: str) -> str:
     import google.generativeai as genai
     genai.configure(api_key=settings.google_api_key)
     model = genai.GenerativeModel("gemini-1.5-flash")
-    resp = await asyncio.to_thread(model.generate_content, prompt)
+    resp  = await asyncio.to_thread(model.generate_content, prompt)
     return resp.text

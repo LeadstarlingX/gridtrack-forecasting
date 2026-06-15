@@ -1,9 +1,7 @@
 import logging
 
-from groq import AsyncGroq
-
-from app.config import settings
 from app.models import DeliveryAnomalyIntegrationEvent, UrgencyResultMessage
+from app.services.chatbot import call_llm_fast
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +18,6 @@ DISTRICT_BOOST: dict[str, int] = {
     "malki":     0,
     "mezzeh":    0,
 }
-
-_groq = AsyncGroq(api_key=settings.groq_api_key)
 
 
 async def score_anomaly(event: DeliveryAnomalyIntegrationEvent) -> UrgencyResultMessage:
@@ -49,12 +45,7 @@ async def _groq_note(event: DeliveryAnomalyIntegrationEvent, score: int) -> str:
         f"urgency={score}/10. "
         "Write a single concise action note for a dispatcher (max 15 words)."
     )
-    resp = await _groq.chat.completions.create(
-        model="llama3-8b-8192",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=40,
-    )
-    return resp.choices[0].message.content.strip()
+    return await call_llm_fast(prompt)
 
 
 def _fallback_note(event: DeliveryAnomalyIntegrationEvent, score: int) -> str:
