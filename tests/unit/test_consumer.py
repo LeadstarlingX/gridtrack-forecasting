@@ -133,13 +133,14 @@ async def test_run_consumer_sets_ready_event(mocker):
         await _cancel(task)
 
 
-async def test_run_consumer_subscribes_to_both_exchanges(mocker):
+async def test_run_consumer_subscribes_to_all_exchanges(mocker):
     mock_conn, mock_channel, _, __ = make_mock_infra()
     task = await _start_consumer_task(mocker, mock_conn)
     try:
         declared = [c.args[0] for c in mock_channel.declare_exchange.call_args_list]
         assert "gridtrack.anomaly" in declared
         assert "gridtrack.positions" in declared
+        assert "gridtrack.completions" in declared
     finally:
         await _cancel(task)
 
@@ -148,7 +149,7 @@ async def test_run_consumer_registers_consume_callback_per_exchange(mocker):
     mock_conn, _, __, mock_queue = make_mock_infra()
     task = await _start_consumer_task(mocker, mock_conn)
     try:
-        assert mock_queue.consume.call_count == 2
+        assert mock_queue.consume.call_count == len(consumer_mod.EXCHANGE_MAP)
     finally:
         await _cancel(task)
 
