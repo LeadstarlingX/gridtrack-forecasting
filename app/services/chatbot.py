@@ -28,8 +28,9 @@ async def _call_groq(prompt: str) -> str:
 
 
 async def _call_gemini(prompt: str) -> str:
+    import asyncio
     import google.generativeai as genai
     genai.configure(api_key=settings.google_api_key)
     model = genai.GenerativeModel("gemini-1.5-flash")
-    resp = model.generate_content(prompt)
+    resp = await asyncio.to_thread(model.generate_content, prompt)
     return resp.text
