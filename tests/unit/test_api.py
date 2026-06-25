@@ -45,7 +45,7 @@ async def test_health_rejects_post(client):
 # ── /chat ─────────────────────────────────────────────────────────────────────
 
 async def test_chat_returns_llm_answer(client, mocker):
-    mocker.patch("app.main.call_llm", return_value="5 active deliveries in mezzeh.")
+    mocker.patch("app.main.call_llm_with_tools", return_value="5 active deliveries in mezzeh.")
     resp = await client.post(
         "/chat",
         json={"question": "How many deliveries?", "context": {"district": "mezzeh", "active": 5}},
@@ -61,7 +61,7 @@ async def test_chat_prompt_includes_question_and_context(client, mocker):
         captured["prompt"] = prompt
         return "ok"
 
-    mocker.patch("app.main.call_llm", side_effect=capture_llm)
+    mocker.patch("app.main.call_llm_with_tools", side_effect=capture_llm)
     await client.post(
         "/chat",
         json={"question": "which district is busiest?", "context": {"district": "babtouma"}},
