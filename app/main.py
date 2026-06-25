@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from app.messaging import consumer as _consumer
 from app.messaging.consumer import start_consumer
 from app.models import ChatBody, RecommendationRequest, RecommendationResponse, StaffingRequest, StaffingResponse
-from app.services.chatbot import call_llm, call_llm_with_tools, stream_llm
+from app.services.chatbot import call_llm, call_llm_with_tools, compress_context, stream_llm
 from app.services.recommendation import get_recommendation
 from app.services.staffing import get_staffing
 
@@ -62,7 +62,7 @@ async def chat(body: ChatBody):
     prompt = (
         f"You are a delivery operations assistant in Damascus.\n"
         f"You have access to tools that can fetch real-time district data.\n"
-        f"Operational context (analytics snapshot): {json.dumps(body.context)}\n"
+        f"Operational context (analytics snapshot): {compress_context(body.context)}\n"
         f"Question: {body.question}\n"
         f"Answer concisely, using numbers. Prefer tool calls for live data."
     )

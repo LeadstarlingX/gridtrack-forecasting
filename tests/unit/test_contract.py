@@ -55,8 +55,14 @@ def test_forecast_queue_name_matches_dotnet_listener():
 
 def test_no_extra_or_missing_message_type_entries():
     """Exactly two outbound message types — adding one without wiring .NET would silently drop it."""
-    assert set(_MESSAGE_TYPE_HEADERS.keys()) == {"UrgencyResultMessage", "ForecastResultMessage"}
-    assert set(_QUEUE_MAP.keys()) == {"UrgencyResultMessage", "ForecastResultMessage"}
+    expected = {
+        "UrgencyResultMessage",
+        "ForecastResultMessage",
+        "DemandSurgeMessage",
+        "AnomalyIncidentMessage",
+    }
+    assert set(_MESSAGE_TYPE_HEADERS.keys()) == expected
+    assert set(_QUEUE_MAP.keys()) == expected
 
 
 # ── UrgencyResultMessage JSON schema ─────────────────────────────────────────

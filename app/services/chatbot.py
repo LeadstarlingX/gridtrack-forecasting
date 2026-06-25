@@ -24,6 +24,57 @@ _groq         = AsyncGroq(api_key=settings.groq_api_key)
 _FAST_MODEL   = "llama-3.1-8b-instant"       # urgency notes, short tasks
 _QUALITY_MODEL = "llama-3.3-70b-versatile"   # chatbot, tools, incidents, staffing
 
+
+# ── Context compression ──────────────────────────────────────────────────────
+ 
+# Groq free tier: 12 000 TPM.  Reserve ~400 tokens for the response and ~150
+# for system text / question, leaving ~11 450 tokens of input headroom.
+# 8 000 chars ≈ 2 000 tokens — conservative enough to absorb several concurrent
+# requests in the same minute without hitting the per-minute ceiling.
+_CONTEXT_CHAR_BUDGET = 8_000
+ 
+ 
+def compress_context(ctx: dict, char_budget: int = _CONTEXT_CHAR_BUDGET) -> str:
+    """Compress a context dict to fit inside *char_budget* characters.
+ 
+    Returns the raw JSON serialisation unchanged if it already fits.
+    Otherwise applies progressively tighter structural compression:
+ 
+    - Lists are truncated to a leading sample with a trailing omission note
+      (e.g. "…18 more items omitted") so the LLM knows it has a sample.
+    - Long string values are tail-truncated with a "…" marker.
+    - Dict keys and nesting are always preserved.
+ 
+    Falls back to a hard string truncation as a last resort so the budget
+    is guaranteed regardless of input shape.
+    """
+    raw = json.dumps(ctx)
+    if len(raw) <= char_budget:
+        return raw
+ 
+    def _compress(v: object, max_items: int, max_str: int) -> object:
+        if isinstance(v, dict):
+            return {k: _compress(val, max_items, max_str) for k, val in v.items()}
+        if isinstance(v, list):
+            if len(v) <= max_items:
+                return [_compress(i, max_items, max_str) for i in v]
+            sample = [_compress(i, max_items, max_str) for i in v[:max_items]]
+            return sample + [f"\u2026{len(v) - max_items} more items omitted"]
+        if isinstance(v, str) and len(v) > max_str:
+            return v[:max_str] + "\u2026"
+        return v
+ 
+    # Progressively tighter passes: (max_list_items, max_string_chars)
+    for max_items, max_str in [(10, 300), (5, 150), (3, 80), (2, 50), (1, 30)]:
+        result = json.dumps(_compress(ctx, max_items, max_str))
+        if len(result) <= char_budget:
+            return result
+ 
+    # Guarantee: hard-truncate the tightest pass — never blows the budget
+    return json.dumps(_compress(ctx, 1, 30))[:char_budget] + "\u2026"
+
+
+
 # ── Tools available to the chatbot ──────────────────────────────────────────
 
 _TOOLS: list[dict[str, Any]] = [
