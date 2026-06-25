@@ -36,12 +36,15 @@ async def publish(channel: aio_pika.Channel, message: BaseModel) -> None:
         return
 
     body = message.model_dump_json().encode()
-    await channel.default_exchange.publish(
-        aio_pika.Message(
-            body=body,
-            content_type="application/json",
-            headers={"message-type": message_type},
-        ),
-        routing_key=queue_name,
-    )
-    logger.info("Published %s → %s", type_name, queue_name)
+    try:
+        await channel.default_exchange.publish(
+            aio_pika.Message(
+                body=body,
+                content_type="application/json",
+                headers={"message-type": message_type},
+            ),
+            routing_key=queue_name,
+        )
+        logger.info("Published %s → %s", type_name, queue_name)
+    except Exception as exc:
+        logger.warning("Failed to publish %s to %s: %s", type_name, queue_name, exc)
