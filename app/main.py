@@ -89,7 +89,7 @@ async def chat_stream_post(body: ChatBody):
 def _stream_response(question: str, ctx: dict):
     prompt = (
         f"You are a delivery operations assistant in Damascus.\n"
-        f"Operational context: {json.dumps(ctx)}\n"
+        f"Operational context: {compress_context(ctx)}\n"
         f"Question: {question}\n"
         f"Answer concisely, using numbers from the context."
     )

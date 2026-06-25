@@ -232,6 +232,8 @@ async def _call_groq(prompt: str) -> str:
 
 
 async def _call_gemini(prompt: str) -> str:
+    if not settings.google_api_key:
+        raise RuntimeError("Gemini fallback disabled: GOOGLE_API_KEY not set")
     import asyncio
     import google.generativeai as genai
     genai.configure(api_key=settings.google_api_key)
