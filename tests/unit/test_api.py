@@ -45,7 +45,7 @@ async def test_health_rejects_post(client):
 # ── /chat ─────────────────────────────────────────────────────────────────────
 
 async def test_chat_returns_llm_answer(client, mocker):
-    mocker.patch("app.main.call_llm_with_tools", return_value="5 active deliveries in mezzeh.")
+    mocker.patch("app.main.call_llm_with_tools", return_value=("5 active deliveries in mezzeh.", []))
     resp = await client.post(
         "/chat",
         json={"question": "How many deliveries?", "context": {"district": "mezzeh", "active": 5}},
@@ -57,9 +57,9 @@ async def test_chat_returns_llm_answer(client, mocker):
 async def test_chat_prompt_includes_question_and_context(client, mocker):
     captured: dict = {}
 
-    async def capture_llm(prompt: str) -> str:
+    async def capture_llm(prompt: str) -> tuple[str, list[str]]:
         captured["prompt"] = prompt
-        return "ok"
+        return ("ok", [])
 
     mocker.patch("app.main.call_llm_with_tools", side_effect=capture_llm)
     await client.post(
@@ -263,9 +263,9 @@ async def test_staffing_markdown_fenced_json_is_accepted(client, mocker):
 
 async def test_chat_stream_post_returns_sse_content_type(client, mocker):
     async def fake_stream(_prompt: str):
-        yield "hello"
+        yield '{"token": "hello"}'
 
-    mocker.patch("app.main.stream_llm", side_effect=fake_stream)
+    mocker.patch("app.main.stream_with_tools", side_effect=fake_stream)
     resp = await client.post(
         "/chat/stream",
         json={"question": "How many deliveries?", "context": {}},
@@ -277,9 +277,9 @@ async def test_chat_stream_post_returns_sse_content_type(client, mocker):
 async def test_chat_stream_post_emits_token_events_and_done(client, mocker):
     async def fake_stream(_prompt: str):
         for token in ["Hello", " world"]:
-            yield token
+            yield f'{{"token": "{token}"}}'
 
-    mocker.patch("app.main.stream_llm", side_effect=fake_stream)
+    mocker.patch("app.main.stream_with_tools", side_effect=fake_stream)
     resp = await client.post(
         "/chat/stream",
         json={"question": "Test", "context": {"district": "mezzeh"}},
@@ -293,9 +293,9 @@ async def test_chat_stream_post_emits_token_events_and_done(client, mocker):
 
 async def test_chat_stream_get_returns_sse_via_query_params(client, mocker):
     async def fake_stream(_prompt: str):
-        yield "ok"
+        yield '{"token": "ok"}'
 
-    mocker.patch("app.main.stream_llm", side_effect=fake_stream)
+    mocker.patch("app.main.stream_with_tools", side_effect=fake_stream)
     resp = await client.get("/chat/stream?question=test&context=%7B%7D")
     assert resp.status_code == 200
     assert "text/event-stream" in resp.headers["content-type"]
@@ -304,10 +304,10 @@ async def test_chat_stream_get_returns_sse_via_query_params(client, mocker):
 
 async def test_chat_stream_done_terminator_present_after_error(client, mocker):
     async def failing_stream(_prompt: str):
-        yield "partial"
+        yield '{"token": "partial"}'
         raise RuntimeError("Network error mid-stream")
 
-    mocker.patch("app.main.stream_llm", side_effect=failing_stream)
+    mocker.patch("app.main.stream_with_tools", side_effect=failing_stream)
     resp = await client.post(
         "/chat/stream",
         json={"question": "Fail halfway", "context": {}},
