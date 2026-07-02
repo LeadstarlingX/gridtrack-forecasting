@@ -54,6 +54,11 @@ class ChatBody(BaseModel):
     context: dict
 
 
+class ReportRequest(BaseModel):
+    messages: list[dict[str, str]] = []
+    context: dict = {}
+
+
 class CandidateContext(BaseModel):
     rank: int
     name: str

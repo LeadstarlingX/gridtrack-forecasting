@@ -8,8 +8,9 @@ from fastapi.responses import StreamingResponse
 
 from app.messaging import consumer as _consumer
 from app.messaging.consumer import start_consumer
-from app.models import ChatBody, RecommendationRequest, RecommendationResponse, StaffingRequest, StaffingResponse
-from app.services.chatbot import call_llm, call_llm_with_tools, compress_context, stream_llm
+from app.models import ChatBody, RecommendationRequest, RecommendationResponse, ReportRequest, StaffingRequest, StaffingResponse
+from app.services.chatbot import call_llm, call_llm_with_tools, compress_context, stream_with_tools
+
 from app.services.recommendation import get_recommendation
 from app.services.staffing import get_staffing
 
@@ -30,6 +31,8 @@ async def lifespan(app: FastAPI):
             await _consumer_task
         except asyncio.CancelledError:
             pass
+    from app.db import close_pool
+    await close_pool()
 
 
 app = FastAPI(title="GridTrack Forecasting Service", lifespan=lifespan)
@@ -66,8 +69,8 @@ async def chat(body: ChatBody):
         f"Question: {body.question}\n"
         f"Answer concisely, using numbers. Prefer tool calls for live data."
     )
-    answer = await call_llm_with_tools(prompt)
-    return {"answer": answer}
+    answer, tools_used = await call_llm_with_tools(prompt)
+    return {"answer": answer, "tools_used": tools_used}
 
 
 @app.get("/chat/stream")
@@ -89,15 +92,16 @@ async def chat_stream_post(body: ChatBody):
 def _stream_response(question: str, ctx: dict):
     prompt = (
         f"You are a delivery operations assistant in Damascus.\n"
+        f"You have access to tools that can fetch real-time district data.\n"
         f"Operational context: {compress_context(ctx)}\n"
         f"Question: {question}\n"
-        f"Answer concisely, using numbers from the context."
+        f"Answer concisely, using numbers. Prefer tool calls for live data."
     )
 
     async def event_generator():
         try:
-            async for token in stream_llm(prompt):
-                yield f"data: {json.dumps({'token': token})}\n\n"
+            async for frame in stream_with_tools(prompt):
+                yield f"data: {frame}\n\n"
         except Exception as exc:
             logger.warning("Streaming error: %s", exc)
         yield "data: [DONE]\n\n"
@@ -109,6 +113,22 @@ def _stream_response(question: str, ctx: dict):
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+# ── PDF report ───────────────────────────────────────────────────────────────
+
+@app.post("/chat/report")
+async def chat_report(body: ReportRequest):
+    """Generate a 1-page PDF operations report from the conversation (3 LLM calls)."""
+    from app.services.report import generate_report
+    from fastapi.responses import Response
+
+    pdf_bytes = await generate_report(body.messages, body.context)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="gridtrack-report.pdf"'},
     )
 
 
@@ -140,3 +160,16 @@ async def transcribe(file: UploadFile = File(...)):
     except Exception as exc:
         logger.warning("Whisper transcription failed: %s", exc)
         raise HTTPException(status_code=503, detail="Transcription service unavailable")
+
+
+# ── MCP server (external agent access) ──────────────────────────────────────
+
+from app.config import settings as _settings
+
+if _settings.mcp_api_key:
+    try:
+        from app.mcp_server import make_mcp_app
+        app.mount("/mcp", make_mcp_app(_settings.mcp_api_key))
+        logger.info("MCP server mounted at /mcp")
+    except (ImportError, AttributeError) as exc:
+        logger.warning("MCP server disabled (%s). Requires mcp>=1.0.0", exc)

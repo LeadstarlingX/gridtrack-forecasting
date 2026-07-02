@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
+import app.services.chatbot as chatbot_module
 from app.services.chatbot import call_llm, _call_groq, _call_gemini
 
 
@@ -51,6 +52,7 @@ async def test_call_groq_passes_prompt_in_user_message(mocker):
 # ── _call_gemini (direct) ─────────────────────────────────────────────────────
 
 async def test_call_gemini_returns_response_text(mocker):
+    mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key="fake-key"))
     mock_model = MagicMock()
     mock_model.generate_content.return_value.text = "gemini response"
     mocker.patch("google.generativeai.configure")
@@ -60,6 +62,7 @@ async def test_call_gemini_returns_response_text(mocker):
 
 
 async def test_call_gemini_passes_prompt_to_model(mocker):
+    mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key="fake-key"))
     mock_model = MagicMock()
     mock_model.generate_content.return_value.text = "ok"
     mocker.patch("google.generativeai.configure")
