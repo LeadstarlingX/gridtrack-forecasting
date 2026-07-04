@@ -9,7 +9,8 @@ from fastapi.responses import StreamingResponse
 from app.messaging import consumer as _consumer
 from app.messaging.consumer import start_consumer
 from app.models import ChatBody, RecommendationRequest, RecommendationResponse, ReportRequest, StaffingRequest, StaffingResponse
-from app.services.chatbot import call_llm, call_llm_with_tools, compress_context, stream_with_tools
+from app.services.chatbot import call_llm, call_llm_with_tools, stream_with_tools
+from app.services.system_prompt import build_prompt
 
 from app.services.recommendation import get_recommendation
 from app.services.staffing import get_staffing
@@ -62,13 +63,7 @@ async def recommend(body: RecommendationRequest) -> RecommendationResponse:
 @app.post("/chat")
 async def chat(body: ChatBody):
     """Non-streaming chat. Uses tool-calling so Groq can query live district state."""
-    prompt = (
-        f"You are a delivery operations assistant in Damascus.\n"
-        f"You have access to tools that can fetch real-time district data.\n"
-        f"Operational context (analytics snapshot): {compress_context(body.context)}\n"
-        f"Question: {body.question}\n"
-        f"Answer concisely, using numbers. Prefer tool calls for live data."
-    )
+    prompt = build_prompt(body.question, body.context)
     answer, tools_used = await call_llm_with_tools(prompt)
     return {"answer": answer, "tools_used": tools_used}
 
@@ -90,13 +85,7 @@ async def chat_stream_post(body: ChatBody):
 
 
 def _stream_response(question: str, ctx: dict):
-    prompt = (
-        f"You are a delivery operations assistant in Damascus.\n"
-        f"You have access to tools that can fetch real-time district data.\n"
-        f"Operational context: {compress_context(ctx)}\n"
-        f"Question: {question}\n"
-        f"Answer concisely, using numbers. Prefer tool calls for live data."
-    )
+    prompt = build_prompt(question, ctx)
 
     async def event_generator():
         try:

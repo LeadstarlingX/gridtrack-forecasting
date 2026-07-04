@@ -53,19 +53,19 @@ async def test_call_groq_passes_prompt_in_user_message(mocker):
 
 async def test_call_gemini_returns_response_text(mocker):
     mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key="fake-key"))
-    mock_model = MagicMock()
-    mock_model.generate_content.return_value.text = "gemini response"
-    mocker.patch("google.generativeai.configure")
-    mocker.patch("google.generativeai.GenerativeModel", return_value=mock_model)
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value.text = "gemini response"
+    mocker.patch("google.genai.Client", return_value=mock_client)
     result = await _call_gemini("test prompt")
     assert result == "gemini response"
 
 
 async def test_call_gemini_passes_prompt_to_model(mocker):
     mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key="fake-key"))
-    mock_model = MagicMock()
-    mock_model.generate_content.return_value.text = "ok"
-    mocker.patch("google.generativeai.configure")
-    mocker.patch("google.generativeai.GenerativeModel", return_value=mock_model)
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value.text = "ok"
+    mocker.patch("google.genai.Client", return_value=mock_client)
     await _call_gemini("how many drivers?")
-    mock_model.generate_content.assert_called_once_with("how many drivers?")
+    call_kwargs = mock_client.models.generate_content.call_args.kwargs
+    assert call_kwargs["model"] == "gemini-2.0-flash"
+    assert call_kwargs["contents"] == "how many drivers?"

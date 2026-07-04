@@ -107,14 +107,15 @@ def _build_pdf(summary: str, recommendations: str, actions: str) -> bytes:
     pdf = FPDF()
     pdf.set_margins(20, 20, 20)
     pdf.add_page()
+    w = pdf.epw  # effective page width (page - margins), avoids multi_cell(0,...) issues
 
     # ── Title block ──────────────────────────────────────────────────────────
     pdf.set_font("Helvetica", style="B", size=18)
-    pdf.multi_cell(0, 12, "GridTrack Operations Report")
+    pdf.multi_cell(w, 12, "GridTrack Operations Report", new_x="LMARGIN", new_y="NEXT")
 
     pdf.set_font("Helvetica", size=9)
     pdf.set_text_color(120, 120, 120)
-    pdf.multi_cell(0, 6, f"Generated: {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}")
+    pdf.multi_cell(w, 6, f"Generated: {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
     pdf.set_draw_color(200, 200, 200)
@@ -125,9 +126,9 @@ def _build_pdf(summary: str, recommendations: str, actions: str) -> bytes:
     def section(title: str, body: str) -> None:
         pdf.set_text_color(0, 0, 0)
         pdf.set_font("Helvetica", style="B", size=11)
-        pdf.multi_cell(0, 8, title)
+        pdf.multi_cell(w, 8, title, new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", size=10)
-        pdf.multi_cell(0, 6, _sanitize(body))
+        pdf.multi_cell(w, 6, _sanitize(body), new_x="LMARGIN", new_y="NEXT")
         pdf.ln(3)
 
     section("Situation Summary", summary)

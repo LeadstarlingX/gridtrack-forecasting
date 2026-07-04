@@ -174,5 +174,10 @@ async def get_peak_hours(district_id: str, days: int = 7) -> str:
 
 
 def make_mcp_app(api_key: str):
-    """Return the FastMCP ASGI app wrapped with Bearer auth."""
-    return _BearerAuth(mcp.streamable_http_app(), api_key)
+    """Return the FastMCP SSE ASGI app wrapped with Bearer auth.
+
+    Endpoints (after FastAPI strips the /mcp mount prefix):
+      GET  /mcp/sse        — establish SSE connection
+      POST /mcp/messages   — send JSON-RPC requests
+    """
+    return _BearerAuth(mcp.sse_app(), api_key)
