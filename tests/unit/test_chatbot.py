@@ -590,6 +590,247 @@ async def test_stream_with_tools_returns_error_when_both_fail(mocker):
     assert any("unavailable" in json.loads(f).get("token", "") for f in frames)
 
 
+# ── compress_context — additional branches ────────────────────────────────────
+
+def test_compress_context_small_list_not_truncated():
+    """Line 63: list ≤ max_items branch — items preserved, but outer string still compressed."""
+    ctx = {"drivers": [1, 2, 3], "report": "x" * 600}
+    result = compress_context(ctx, char_budget=100)
+    data = json.loads(result)
+    assert "drivers" in data
+    assert isinstance(data["drivers"], list)
+
+
+def test_compress_context_hard_truncate_when_all_passes_fail():
+    """Line 77: even the tightest compression pass exceeds budget → hard-truncate."""
+    ctx = {"a": {"b": {"c": {"d": {"e": "x" * 1000}}}}}
+    result = compress_context(ctx, char_budget=5)
+    assert result.endswith("…")
+
+
+# ── _get_gemini_tools — cache-miss path ──────────────────────────────────────
+
+def test_get_gemini_tools_populates_cache_on_miss(mocker):
+    """Lines 195-205: when cache is None, builds the tool list from google.genai.types."""
+    mocker.patch.object(chatbot_module, "_gemini_tools_cache", None)
+    mocker.patch("google.genai.types", MagicMock())
+    result = _get_gemini_tools()
+    assert isinstance(result, list)
+    assert len(result) > 0
+
+
+# ── _run_tool — exception handlers ───────────────────────────────────────────
+
+async def test_run_tool_postgres_exception_returns_error_json(mocker):
+    """Lines 247-249: pool.fetch raises → JSON error response."""
+    import app.db
+    mock_pool = AsyncMock()
+    mock_pool.fetch.side_effect = RuntimeError("connection lost")
+    mocker.patch("app.db.get_pool", new=AsyncMock(return_value=mock_pool))
+    result = json.loads(await _run_tool("query_postgres", {"sql": 'SELECT 1'}))
+    assert "error" in result
+    assert "connection lost" in result["error"]
+
+
+async def test_run_tool_clickhouse_exception_returns_error_json(mocker):
+    """Lines 265-267: ch_query raises → JSON error response."""
+    import app.ch
+    mocker.patch("app.ch.ch_query", new=AsyncMock(side_effect=RuntimeError("ch timeout")))
+    result = json.loads(await _run_tool("query_clickhouse",
+                                        {"sql": "SELECT count() FROM driver_positions"}))
+    assert "error" in result
+    assert "ch timeout" in result["error"]
+
+
+# ── _recover_tool_calls — JSON decode failure ─────────────────────────────────
+
+def test_recover_tool_calls_returns_none_on_invalid_args_json():
+    """Lines 361-362: args portion is not valid JSON → returns None."""
+    exc = _make_exc('<function=query_postgres{"bad:json}</function>')
+    assert _recover_tool_calls(exc) is None
+
+
+# ── _call_gemini — edge cases ─────────────────────────────────────────────────
+
+async def test_call_gemini_raises_when_no_api_key(mocker):
+    """Line 426: empty google_api_key → RuntimeError."""
+    mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key=""))
+    with pytest.raises(RuntimeError, match="Gemini fallback disabled"):
+        await _call_gemini("test")
+
+
+async def test_call_gemini_falls_back_to_parts_when_text_raises(mocker):
+    """Lines 441-443: resp.text raises → joins candidate parts."""
+    from unittest.mock import PropertyMock
+    mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key="key"))
+    mock_resp = MagicMock()
+    type(mock_resp).text = PropertyMock(side_effect=Exception("no text"))
+    part = MagicMock()
+    part.text = "part answer"
+    mock_resp.candidates = [MagicMock()]
+    mock_resp.candidates[0].content.parts = [part]
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value = mock_resp
+    mocker.patch("google.genai.Client", return_value=mock_client)
+    mocker.patch("google.genai.types", MagicMock())
+    result = await _call_gemini("test")
+    assert result == "part answer"
+
+
+# ── stream_with_tools — Gemini empty-answer fallback paths ───────────────────
+
+async def test_stream_with_tools_handles_non_json_gemini_frame(mocker):
+    """Lines 380-381: frame fails JSON parse → silently ignored, got_answer stays False."""
+    async def gemini_non_json(prompt):
+        yield "not valid json"
+
+    async def groq_answer(prompt):
+        yield json.dumps({"token": "groq stepped in"})
+
+    mocker.patch("app.services.chatbot._stream_gemini_with_tools", side_effect=gemini_non_json)
+    mocker.patch("app.services.chatbot._stream_groq_with_tools", side_effect=groq_answer)
+    frames = await _collect(stream_with_tools("q"))
+    # frames includes the raw non-JSON frame and the Groq token frame
+    assert json.dumps({"token": "groq stepped in"}) in frames
+
+
+async def test_stream_with_tools_falls_back_when_gemini_yields_no_token(mocker):
+    """Line 384: Gemini completes with only tool frames → falls back to Groq."""
+    async def gemini_tool_only(prompt):
+        yield json.dumps({"tool": "get_all_districts_summary"})
+
+    async def groq_answer(prompt):
+        yield json.dumps({"token": "groq answer"})
+
+    mocker.patch("app.services.chatbot._stream_gemini_with_tools", side_effect=gemini_tool_only)
+    mocker.patch("app.services.chatbot._stream_groq_with_tools", side_effect=groq_answer)
+    frames = await _collect(stream_with_tools("q"))
+    assert any("groq answer" in json.loads(f).get("token", "") for f in frames)
+
+
+# ── _stream_groq_with_tools — exception recovery path ────────────────────────
+
+async def test_stream_groq_recovers_tool_calls_from_malformed_exception(mocker):
+    """Lines 456-471: Groq raises with recoverable failed_generation → tool yielded, continues."""
+    exc = Exception("tool_use_failed")
+    exc.body = {"error": {"failed_generation": "<function=get_all_districts_summary/>"}}
+
+    final_resp = _make_groq_resp_with_tools(None, "recovered answer")
+    mocker.patch("app.services.chatbot._groq.chat.completions.create",
+                 new=AsyncMock(side_effect=[exc, final_resp]))
+    mocker.patch("app.services.chatbot._run_tool", new=AsyncMock(return_value='{}'))
+    frames = await _collect(_stream_groq_with_tools("q"))
+    assert any("tool" in json.loads(f) for f in frames)
+    assert any("recovered answer" in json.loads(f).get("token", "") for f in frames)
+
+
+async def test_stream_groq_survives_force_answer_exception(mocker):
+    """Lines 498-500: force-final call raises → falls back to msg.content."""
+    tc = _make_tool_call("get_all_districts_summary", "{}")
+    resp_with_tools = _make_groq_resp_with_tools([tc], "partial content")
+    mocker.patch("app.services.chatbot._groq.chat.completions.create",
+                 new=AsyncMock(side_effect=[
+                     resp_with_tools, resp_with_tools, resp_with_tools,
+                     Exception("API error on final"),
+                 ]))
+    mocker.patch("app.services.chatbot._run_tool", new=AsyncMock(return_value="{}"))
+    frames = await _collect(_stream_groq_with_tools("q"))
+    assert any("token" in json.loads(f) for f in frames)
+
+
+# ── _call_groq_with_tools — exception recovery path ─────────────────────────
+
+async def test_call_groq_with_tools_recovers_from_malformed_exception(mocker):
+    """Lines 514-529: Groq raises with recoverable failed_generation → continues."""
+    exc = Exception("tool_use_failed")
+    exc.body = {"error": {"failed_generation": "<function=get_all_districts_summary/>"}}
+
+    final_resp = _make_groq_resp_with_tools(None, "recovered")
+    mocker.patch("app.services.chatbot._groq.chat.completions.create",
+                 new=AsyncMock(side_effect=[exc, final_resp]))
+    mocker.patch("app.services.chatbot._run_tool", new=AsyncMock(return_value='{}'))
+    answer, tools = await _call_groq_with_tools("q")
+    assert "get_all_districts_summary" in tools
+    assert answer == "recovered"
+
+
+async def test_call_groq_with_tools_survives_force_answer_exception(mocker):
+    """Lines 548-556: force-final call raises → returns msg.content fallback."""
+    tc = _make_tool_call("get_all_districts_summary", "{}")
+    resp_with_tools = _make_groq_resp_with_tools([tc], "fallback content")
+    mocker.patch("app.services.chatbot._groq.chat.completions.create",
+                 new=AsyncMock(side_effect=[
+                     resp_with_tools, resp_with_tools, resp_with_tools,
+                     Exception("API down"),
+                 ]))
+    mocker.patch("app.services.chatbot._run_tool", new=AsyncMock(return_value="{}"))
+    answer, tools = await _call_groq_with_tools("q")
+    assert isinstance(answer, str)
+
+
+# ── _stream_gemini_with_tools — loop-exhausted force-final ───────────────────
+
+async def test_stream_gemini_force_answer_after_loop_exhaustion(mocker):
+    """Lines 645-651: 3 tool-call iterations → forces a final text answer."""
+    mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key="key"))
+    mocker.patch("google.genai.Client")
+    mocker.patch("google.genai.types", MagicMock())
+    mocker.patch("app.services.chatbot._get_gemini_tools", return_value=[])
+    mocker.patch("app.services.chatbot._run_tool", new=AsyncMock(return_value='{"data": 1}'))
+    resp_with_tools = _make_gemini_resp_with_tools("query_postgres", {"sql": "SELECT 1"})
+    resp_final = _make_gemini_resp_no_tools("forced answer")
+    mocker.patch("app.services.chatbot._gemini_generate",
+                 new=AsyncMock(side_effect=[resp_with_tools] * 3 + [resp_final]))
+    frames = await _collect(_stream_gemini_with_tools("q"))
+    assert any("forced answer" in json.loads(f).get("token", "") for f in frames)
+
+
+async def test_stream_gemini_force_answer_exception_yields_empty_token(mocker):
+    """Lines 652-653: force-final call raises → yields empty token frame."""
+    mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key="key"))
+    mocker.patch("google.genai.Client")
+    mocker.patch("google.genai.types", MagicMock())
+    mocker.patch("app.services.chatbot._get_gemini_tools", return_value=[])
+    mocker.patch("app.services.chatbot._run_tool", new=AsyncMock(return_value='{}'))
+    resp_with_tools = _make_gemini_resp_with_tools("query_postgres", {"sql": "SELECT 1"})
+    mocker.patch("app.services.chatbot._gemini_generate",
+                 new=AsyncMock(side_effect=[resp_with_tools] * 3 + [Exception("force failed")]))
+    frames = await _collect(_stream_gemini_with_tools("q"))
+    assert any("token" in json.loads(f) for f in frames)
+
+
+# ── _call_gemini_with_tools — loop-exhausted force-final ─────────────────────
+
+async def test_call_gemini_with_tools_force_answer_after_loop_exhaustion(mocker):
+    """Lines 696-702: 3 tool-call iterations → forces final text answer."""
+    mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key="key"))
+    mocker.patch("google.genai.Client")
+    mocker.patch("google.genai.types", MagicMock())
+    mocker.patch("app.services.chatbot._get_gemini_tools", return_value=[])
+    mocker.patch("app.services.chatbot._run_tool", new=AsyncMock(return_value='{}'))
+    resp_with_tools = _make_gemini_resp_with_tools("query_postgres", {"sql": "SELECT 1"})
+    resp_final = _make_gemini_resp_no_tools("final answer")
+    mocker.patch("app.services.chatbot._gemini_generate",
+                 new=AsyncMock(side_effect=[resp_with_tools] * 3 + [resp_final]))
+    answer, tools = await _call_gemini_with_tools("q")
+    assert answer == "final answer"
+
+
+async def test_call_gemini_with_tools_force_answer_exception_returns_empty(mocker):
+    """Lines 703-704: force-final call raises → returns ("", tools)."""
+    mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key="key"))
+    mocker.patch("google.genai.Client")
+    mocker.patch("google.genai.types", MagicMock())
+    mocker.patch("app.services.chatbot._get_gemini_tools", return_value=[])
+    mocker.patch("app.services.chatbot._run_tool", new=AsyncMock(return_value='{}'))
+    resp_with_tools = _make_gemini_resp_with_tools("query_postgres", {"sql": "SELECT 1"})
+    mocker.patch("app.services.chatbot._gemini_generate",
+                 new=AsyncMock(side_effect=[resp_with_tools] * 3 + [Exception("force failed")]))
+    answer, tools = await _call_gemini_with_tools("q")
+    assert answer == ""
+    assert isinstance(tools, list)
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _make_groq_resp_with_tools(tool_calls, content):
