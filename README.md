@@ -1,7 +1,8 @@
 In response to trends in the gaming industry, as of 1st of September 2026, GridTrack will cease 
-production of the CD pipeline into docker containers and shift to production of stainless-steel containers.
+production of the CD pipeline into docker containers and shift to production of floppy disks.
 
-Developers can still order a pigeon carrier to receive the latest updates right to their doorstep.
+Developers can still order a pigeon carrier to receive the latest updates within a stainless-steel
+container right to their doorstep.
 
 
 # gridtrack-forecasting

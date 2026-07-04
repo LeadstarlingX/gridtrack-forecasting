@@ -11,14 +11,14 @@ rows = []
 for path, info in sorted(data["files"].items()):
     s = info["summary"]
     module = path.replace("\\", "/")
-    rows.append(f"| `{module}` | {s['num_statements']} | {s['missing_lines']} | {s['percent_covered_display']} |")
+    rows.append(f"| `{module}` | {s['num_statements']} | {s['missing_lines']} | {s['percent_covered_display']}% |")
 
 t = data["totals"]
 table = (
     "| Module | Stmts | Miss | Cover |\n"
     "|--------|------:|-----:|------:|\n"
     + "\n".join(rows)
-    + f"\n| **TOTAL** | **{t['num_statements']}** | **{t['missing_lines']}** | **{t['percent_covered_display']}** |"
+    + f"\n| **TOTAL** | **{t['num_statements']}** | **{t['missing_lines']}** | **{t['percent_covered_display']}%** |"
 )
 
 readme = pathlib.Path("README.md")
