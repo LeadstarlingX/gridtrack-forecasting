@@ -1,165 +1,127 @@
-# GridTrack Forecasting Service
+In response to trends in the gaming industry, as of 1st of September 2026, GridTrack will cease 
+production of the CD pipeline into docker containers and shift to production of stainless-steel containers.
 
-Standalone Python microservice for the GridTrack delivery-monitoring system. Handles urgency scoring, district demand forecasting, AI dispatch recommendations, and AI chatbot queries.
+Developers can still order a pigeon carrier to receive the latest updates right to their doorstep.
 
-## Architecture
+
+# gridtrack-forecasting
+
+Python AI/ML pipeline for the GridTrack delivery-monitoring system. Consumes GPS telemetry and
+anomaly events from the .NET backend over RabbitMQ; produces urgency scores, demand forecasts,
+surge alerts, and incident clusters — fed back to the .NET backend for live SignalR broadcast.
+Also serves a streaming AI chatbot, dispatch recommendations, a staffing forecast, audio
+transcription, and an MCP server for external agent access.
+
+## Related repositories
+
+- [GridTrack](https://github.com/LeadstarlingX/GridTrack) — .NET 9 dispatch API (this service's upstream and RabbitMQ host).
+- **gridtrack-forecasting** (this repo) — Python AI/ML pipeline.
+- [GridTrack.Web](https://github.com/LeadstarlingX/GridTrack.Web) — React real-time operator dashboard (SignalR live map).
+
+## What it does
+
+- **Anomaly urgency scoring** — RabbitMQ consumer on `gridtrack.anomaly` scores each flagged delivery 1–10 via Groq, then publishes the result to `gridtrack.urgency-results` for .NET to broadcast via SignalR.
+- **District demand forecasting** — RabbitMQ consumer on `gridtrack.positions` maintains in-memory sliding windows of GPS pings per district; publishes predicted demand to `gridtrack.forecast-results` each flush cycle.
+- **Demand surge detection** — rolling z-score on per-district ping counts; surges above threshold are published via RabbitMQ and broadcast live to the dashboard.
+- **Incident clustering** — groups co-located anomalies into incidents and pushes cluster summaries live.
+- **AI dispatch recommendations** — `POST /recommend` returns a structured ranking of candidate drivers with a recommended action, urgency score, and plain-English reason (Gemini primary, Groq fallback).
+- **Staffing forecast** — `POST /staffing` returns per-district recommended driver counts based on forecasted demand.
+- **Analytics chatbot** — `POST /chat/stream` (SSE) and `POST /chat` drive the operator chatbot; Gemini 2.0 Flash primary with Groq fallback; tool-calling loop queries live PostgreSQL and ClickHouse to answer natural-language questions about fleet state.
+- **PDF report** — `POST /chat/report` generates a 1-page operations PDF from a conversation history.
+- **Audio transcription** — `POST /transcribe` accepts any audio format and returns a text transcript via Groq Whisper.
+- **MCP server** — `/mcp/sse` (SSE) + `/mcp/messages` (JSON-RPC) expose 7 read-only tools for external AI agents: `get_active_drivers`, `get_anomalies`, `get_deliveries_summary`, `get_district_status`, `get_stalled_drivers`, `get_activity_trend`, `get_peak_hours`. Bearer-token auth.
+
+## Architecture & development methodology
 
 ```
 .NET Backend (GridTrack.Api)
         │
-        │  RabbitMQ (fanout exchanges)
-        │  ── gridtrack.anomaly       →  Python scores urgency via Groq
-        │  ── gridtrack.positions     →  Python updates sliding-window forecast
-        │
+        │  RabbitMQ fanout exchanges (inbound)
+        │  ── gridtrack.anomaly     →  urgency scoring  →  publishes gridtrack.urgency-results
+        │  ── gridtrack.positions   →  sliding-window forecast  →  publishes gridtrack.forecast-results
+        │                                                        →  surge / incident detection
         ↓
  gridtrack-forecasting  (this service)
         │
-        │  RabbitMQ (direct queues — .NET listens)
-        │  ── gridtrack.urgency-results   →  .NET broadcasts via SignalR
-        │  ── gridtrack.forecast-results  →  .NET broadcasts via SignalR
-        │
-        │  HTTP (called synchronously by .NET proxy)
-        ├─ POST /chat      →  AI chatbot answer  →  .NET returns to browser
-        └─ POST /recommend →  structured dispatch recommendation  →  .NET delivery drawer
+        │  HTTP — called synchronously by the .NET proxy
+        ├─ POST /recommend            →  dispatch recommendation
+        ├─ POST /staffing             →  per-district staffing advice
+        ├─ POST /chat                 →  chatbot (non-streaming)
+        ├─ POST /chat/stream (SSE)    →  streaming chatbot with tool events
+        ├─ POST /chat/report          →  PDF operations report
+        ├─ POST /transcribe           →  Whisper audio transcription
+        └─ GET  /mcp/sse              →  MCP SSE transport for external agents
+           POST /mcp/messages         →  MCP JSON-RPC tool calls
 ```
 
-## Tech Stack
+Key design points:
 
-- **Runtime**: Python 3.12
-- **Framework**: FastAPI + Uvicorn
-- **Messaging**: aio-pika (RabbitMQ)
-- **AI**: Groq (`llama3-8b-8192`) with Google Gemini Flash fallback
-- **Validation**: Pydantic v2
+- **In-memory sliding windows** — per-district GPS ping counts are accumulated in RAM for sub-millisecond read latency; ClickHouse is used for historical trend queries only.
+- **Gemini primary / Groq fallback** — chatbot and recommendation calls try Gemini 2.0 Flash first (1500 RPD free tier); 429s with a short `retryDelay` are absorbed with a wait; longer waits fall through to Groq. Both providers failing yields a graceful error message.
+- **Tool-call discipline** — the chatbot LLM loop is hard-capped at 3 tool-call rounds; if the model has not produced a text answer by then, a force-answer turn is injected before falling back. Prevents free-tier RPM exhaustion on a single question.
+- **MCP SSE transport** — FastMCP `sse_app()` mounted at `/mcp`; sessions established over `GET /mcp/sse`, JSON-RPC messages sent via `POST /mcp/messages/?session_id=...`.
 
-## Prerequisites
+## Running locally
 
-- Python 3.12+
-- Docker (for RabbitMQ and integration tests)
+**Full stack (recommended) — from the [GridTrack](https://github.com/LeadstarlingX/GridTrack) repo:**
+```bash
+docker compose up -d    # starts all services including this one on :8000
+```
+Secrets (`GROQ_API_KEY`, `GOOGLE_API_KEY`, `MCP_API_KEY`) come from `.env` at the GridTrack repo root.
 
-## Local Development
-
-### 1. Create and activate a virtual environment
-
+**Standalone:**
 ```bash
 python -m venv .venv
 
 # Windows
 .venv\Scripts\activate
-
 # macOS / Linux
 source .venv/bin/activate
-```
 
-### 2. Install dependencies
-
-```bash
 pip install -r requirements-dev.txt
-```
+cp .env.example .env    # fill in RABBITMQ_URL, GROQ_API_KEY, GOOGLE_API_KEY
 
-### 3. Configure environment variables
+# Infrastructure only (from the GridTrack repo):
+docker compose up -d gridtrack.rabbitmq gridtrack.db gridtrack.clickhouse
 
-```bash
-cp .env.example .env
-# Fill in your secrets
-```
-
-`.env` file format:
-
-```
-RABBITMQ_URL=amqp://guest:guest@localhost:5672
-GROQ_API_KEY=gsk_...
-GOOGLE_API_KEY=AIza...
-```
-
-### 4. Start RabbitMQ
-
-```bash
-docker run -d -p 5672:5672 -p 15672:15672 rabbitmq:management-alpine
-```
-
-### 5. Run the service
-
-```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
-The service starts and logs `Consumer ready — waiting for messages`. Endpoints:
+The service logs `Consumer ready — waiting for messages` once the RabbitMQ consumer is connected.
+
+## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/health` | Liveness probe → `{"status":"ok"}` |
-| `GET`  | `/ready` | Readiness probe — 503 until RabbitMQ consumer is connected |
-| `POST` | `/chat` | AI chatbot: `{question, context}` → `{answer}` |
-| `POST` | `/recommend` | Dispatch recommendation: delivery context + top-3 driver candidates → `{recommended_action, candidate_rank, reason, urgency_score}` |
+| `GET`  | `/ready` | Readiness — 503 until RabbitMQ consumer connected |
+| `POST` | `/chat` | Chatbot (non-streaming): `{question, context}` → `{answer, tools_used}` |
+| `POST` | `/chat/stream` | Chatbot (SSE): yields `{"tool":"name"}` frames then `{"token":"..."}` |
+| `POST` | `/chat/report` | PDF report generated from a conversation history |
+| `POST` | `/transcribe` | Audio → text via Groq Whisper |
+| `POST` | `/recommend` | Dispatch recommendation for a delivery and candidate drivers |
+| `POST` | `/staffing` | Per-district staffing forecast |
+| `GET`  | `/mcp/sse` | MCP SSE connection (Bearer auth required) |
+| `POST` | `/mcp/messages` | MCP JSON-RPC tool calls (Bearer auth required) |
 
 ## Testing
 
 ```bash
 # Unit tests with coverage (no infrastructure needed)
-pytest tests/unit/
+pytest tests/unit/ --cov=app --cov-report=term-missing
 
-# Integration tests (requires Docker for RabbitMQ)
+# Integration tests (requires RabbitMQ via Docker)
 pytest tests/integration/ --no-cov -v
-```
 
-Coverage runs automatically on every `pytest tests/unit/` invocation (configured in `pytest.ini`). To generate an HTML report:
-
-```bash
-pytest tests/unit/ --cov-report=html
+# HTML coverage report
+pytest tests/unit/ --cov=app --cov-report=html
 ```
 
 ## Coverage
 
-Unit-test coverage as of 2026-06-14 (`pytest tests/unit/`):
-
-| Module | Stmts | Miss | Cover | Notes |
-|--------|------:|-----:|------:|-------|
-| `app/__init__.py` | 0 | 0 | **100%** | |
-| `app/config.py` | 7 | 0 | **100%** | |
-| `app/main.py` | 41 | 0 | **100%** | |
-| `app/messaging/consumer.py` | 45 | 0 | **100%** | |
-| `app/messaging/publisher.py` | 19 | 0 | **100%** | |
-| `app/models.py` | 58 | 0 | **100%** | |
-| `app/services/anomaly.py` | 25 | 3 | 88% | `_groq_note` live API call |
-| `app/services/chatbot.py` | 20 | 0 | **100%** | |
-| `app/services/forecast.py` | 40 | 3 | 92% | publish path requires live RabbitMQ |
-| `app/services/recommendation.py` | 54 | 6 | 89% | exception handler paths |
-| **TOTAL** | **309** | **12** | **96%** | |
-
-The remaining gaps in `anomaly.py`, `forecast.py`, and `recommendation.py` are live external-call paths (Groq API, RabbitMQ publish) and exception handler branches that are intentionally not triggered in unit tests.
-
-## Deployment (Render)
-
-- Runtime: **Docker** (uses `Dockerfile`)
-- Health check path: `/health`
-
-Required environment variables in Render dashboard:
-
-```
-RABBITMQ_URL   = amqps://user:pass@bunny.cloudamqp.com/vhost
-GROQ_API_KEY   = gsk_...
-GOOGLE_API_KEY = AIza...
-```
-
-Build Docker image locally:
-
-```bash
-docker build -t gridtrack-forecasting:latest .
-docker run -p 8000:8000 \
-  -e RABBITMQ_URL=amqp://guest:guest@host.docker.internal:5672 \
-  -e GROQ_API_KEY=gsk_... \
-  -e GOOGLE_API_KEY=AIza... \
-  gridtrack-forecasting:latest
-```
-
-## Districts
-
-| ID | Name | Center |
-|---|---|---|
-| `mezzeh` | Mezzeh | 33.505, 36.243 |
-| `kafrsousa` | Kafr Sousa | 33.497, 36.272 |
-| `malki` | Malki | 33.517, 36.281 |
-| `babtouma` | Bab Touma | 33.522, 36.307 |
+<!-- COVERAGE_START -->
+*Auto-updated by CI on every push.*
+<!-- COVERAGE_END -->
 
 ## License
 

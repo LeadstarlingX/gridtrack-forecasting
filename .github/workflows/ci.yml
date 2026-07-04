@@ -24,7 +24,13 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Run unit tests
-        run: pytest tests/unit/ -v --tb=short
+        run: pytest tests/unit/ -v --tb=short --cov=app --cov-report=json
+
+      - name: Upload coverage JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-json
+          path: coverage.json
 
   integration-tests:
     name: Integration Tests
@@ -60,3 +66,33 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t gridtrack-forecasting:ci .
+
+  update-readme:
+    name: Update README Coverage
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/development')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Download coverage JSON
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-json
+          path: .
+
+      - name: Update README coverage table
+        run: python update_readme_coverage.py
+
+      - name: Commit README
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --cached --quiet || git commit -m "ci: update coverage table [without ci]"
+          git push
