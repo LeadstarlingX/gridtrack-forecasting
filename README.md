@@ -7,7 +7,7 @@ container right to their doorstep.
 
 # gridtrack-forecasting
 
-Python AI/ML pipeline for the GridTrack delivery-monitoring system. Consumes GPS telemetry and
+Python AI/ML pipeline for the GridTrack AI Agent-integrable delivery-monitoring system. Consumes GPS telemetry and
 anomaly events from the .NET backend over RabbitMQ; produces urgency scores, demand forecasts,
 surge alerts, and incident clusters — fed back to the .NET backend for live SignalR broadcast.
 Also serves a streaming AI chatbot, dispatch recommendations, a staffing forecast, audio
