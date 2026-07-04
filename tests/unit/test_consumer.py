@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import app.messaging.consumer as consumer_mod
-from app.messaging.consumer import start_consumer, _run_consumer
-from app.models import DeliveryAnomalyIntegrationEvent
+from app.messaging.consumer import start_consumer, _run_consumer, handle_position, handle_anomaly
+from app.models import DeliveryAnomalyIntegrationEvent, DriverPositionIntegrationEvent
 
 
 def make_mock_infra():
@@ -265,3 +265,104 @@ async def test_on_message_handles_invalid_json_without_raising(mocker, caplog):
     await _cancel(task)
 
     assert "Error processing message" in caplog.text
+
+
+# ── handle_position ───────────────────────────────────────────────────────────
+
+def _make_position_event(**overrides):
+    base = dict(
+        driverId="00000000-0000-0000-0000-000000000001",
+        districtId="mezzeh",
+        lat=33.5,
+        lng=36.2,
+        deliveryStatus="InTransit",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+    return DriverPositionIntegrationEvent(**(base | overrides))
+
+
+async def test_handle_position_no_forecast_returns_empty_list(mocker):
+    mocker.patch("app.messaging.consumer.update_forecast", new=AsyncMock(return_value=None))
+    result = await handle_position(_make_position_event())
+    assert result == []
+
+
+async def test_handle_position_forecast_no_surge_returns_one_item(mocker):
+    from app.models import ForecastResultMessage
+    forecast = ForecastResultMessage(
+        districtId="mezzeh", expectedDeliveries=20,
+        staffingRatio=0.1, label="", color="", generatedAt="2026-01-01T00:00:00"
+    )
+    mocker.patch("app.messaging.consumer.update_forecast", new=AsyncMock(return_value=forecast))
+    mocker.patch("app.messaging.consumer.check_surge", return_value=None)
+    result = await handle_position(_make_position_event())
+    assert result == [forecast]
+
+
+async def test_handle_position_forecast_with_surge_returns_two_items(mocker):
+    from app.models import ForecastResultMessage
+    forecast = ForecastResultMessage(
+        districtId="mezzeh", expectedDeliveries=50,
+        staffingRatio=0.04, label="", color="", generatedAt="2026-01-01T00:00:00"
+    )
+    surge = object()  # any truthy value
+    mocker.patch("app.messaging.consumer.update_forecast", new=AsyncMock(return_value=forecast))
+    mocker.patch("app.messaging.consumer.check_surge", return_value=surge)
+    result = await handle_position(_make_position_event())
+    assert result == [forecast, surge]
+
+
+async def test_handle_position_passes_district_and_deliveries_to_check_surge(mocker):
+    from app.models import ForecastResultMessage
+    forecast = ForecastResultMessage(
+        districtId="kafrsousa", expectedDeliveries=30,
+        staffingRatio=0.1, label="", color="", generatedAt="2026-01-01T00:00:00"
+    )
+    mocker.patch("app.messaging.consumer.update_forecast", new=AsyncMock(return_value=forecast))
+    mock_surge = mocker.patch("app.messaging.consumer.check_surge", return_value=None)
+    await handle_position(_make_position_event(districtId="kafrsousa"))
+    mock_surge.assert_called_once()
+    args = mock_surge.call_args.args
+    assert args[0] == "kafrsousa"
+    assert args[1] == 30
+
+
+# ── handle_anomaly ────────────────────────────────────────────────────────────
+
+def _make_anomaly_event(**overrides):
+    base = dict(
+        deliveryId="00000000-0000-0000-0000-000000000002",
+        districtId="mezzeh",
+        anomalyType="EtaExceeded",
+        reason="driver stalled",
+        driverLat=33.5,
+        driverLng=36.2,
+        occurredAt=datetime.now(timezone.utc).isoformat(),
+    )
+    return DeliveryAnomalyIntegrationEvent(**(base | overrides))
+
+
+async def test_handle_anomaly_always_returns_urgency(mocker):
+    urgency = object()
+    mocker.patch("app.messaging.consumer.score_anomaly", new=AsyncMock(return_value=urgency))
+    mocker.patch("app.messaging.consumer.check_incident", new=AsyncMock(return_value=None))
+    result = await handle_anomaly(_make_anomaly_event())
+    assert result == [urgency]
+
+
+async def test_handle_anomaly_with_incident_returns_two_items(mocker):
+    urgency = object()
+    incident = object()
+    mocker.patch("app.messaging.consumer.score_anomaly", new=AsyncMock(return_value=urgency))
+    mocker.patch("app.messaging.consumer.check_incident", new=AsyncMock(return_value=incident))
+    result = await handle_anomaly(_make_anomaly_event())
+    assert result == [urgency, incident]
+
+
+async def test_handle_anomaly_calls_both_services(mocker):
+    mock_score = mocker.patch("app.messaging.consumer.score_anomaly", new=AsyncMock(return_value=object()))
+    mock_incident = mocker.patch("app.messaging.consumer.check_incident", new=AsyncMock(return_value=None))
+    event = _make_anomaly_event(anomalyType="RouteDeviation")
+    await handle_anomaly(event)
+    mock_score.assert_awaited_once_with(event)
+    mock_incident.assert_awaited_once_with(event)

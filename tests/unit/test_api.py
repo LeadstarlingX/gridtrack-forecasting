@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import AsyncMock
 from httpx import AsyncClient, ASGITransport
 
 
@@ -319,6 +320,39 @@ async def test_chat_stream_done_terminator_present_after_error(client, mocker):
 async def test_chat_stream_missing_question_returns_422(client):
     resp = await client.post("/chat/stream", json={"context": {}})
     assert resp.status_code == 422
+
+
+async def test_chat_stream_get_invalid_json_context_falls_back_to_empty(client, mocker):
+    """Lines 76-77: invalid JSON in context param → ctx = {} (no error)."""
+    async def fake_stream(_prompt: str):
+        yield '{"token": "ok"}'
+
+    mocker.patch("app.main.stream_with_tools", side_effect=fake_stream)
+    resp = await client.get("/chat/stream?question=hello&context=NOT_VALID_JSON")
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+
+
+# ── /chat/report ──────────────────────────────────────────────────────────────
+
+
+async def test_chat_report_returns_pdf_bytes(client, mocker):
+    pdf = b"%PDF-fake"
+    mocker.patch("app.services.report.generate_report", new=AsyncMock(return_value=pdf))
+    resp = await client.post(
+        "/chat/report",
+        json={"messages": [{"role": "user", "content": "hello"}], "context": {}},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/pdf"
+    assert resp.content == pdf
+
+
+async def test_chat_report_sends_attachment_header(client, mocker):
+    mocker.patch("app.services.report.generate_report", new=AsyncMock(return_value=b"%PDF"))
+    resp = await client.post("/chat/report", json={"messages": [], "context": {}})
+    assert "attachment" in resp.headers["content-disposition"]
+    assert "gridtrack-report.pdf" in resp.headers["content-disposition"]
 
 
 # ── /transcribe ───────────────────────────────────────────────────────────────
