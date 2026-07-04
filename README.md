@@ -121,7 +121,30 @@ pytest tests/unit/ --cov=app --cov-report=html
 ## Coverage
 
 <!-- COVERAGE_START -->
-*Auto-updated by CI on every push.*
+| Module | Stmts | Miss | Cover |
+|--------|------:|-----:|------:|
+| `app/__init__.py` | 0 | 0 | 100% |
+| `app/ch.py` | 11 | 0 | 100% |
+| `app/config.py` | 12 | 0 | 100% |
+| `app/db.py` | 11 | 0 | 100% |
+| `app/main.py` | 96 | 6 | 94% |
+| `app/mcp_server.py` | 62 | 1 | 98% |
+| `app/messaging/__init__.py` | 0 | 0 | 100% |
+| `app/messaging/consumer.py` | 71 | 0 | 100% |
+| `app/messaging/publisher.py` | 22 | 2 | 91% |
+| `app/models.py` | 84 | 0 | 100% |
+| `app/services/__init__.py` | 0 | 0 | 100% |
+| `app/services/anomaly.py` | 22 | 2 | 91% |
+| `app/services/chatbot.py` | 367 | 3 | 99% |
+| `app/services/completion.py` | 8 | 0 | 100% |
+| `app/services/forecast.py` | 42 | 3 | 93% |
+| `app/services/incident.py` | 47 | 9 | 81% |
+| `app/services/recommendation.py` | 54 | 6 | 89% |
+| `app/services/report.py` | 63 | 0 | 100% |
+| `app/services/staffing.py` | 47 | 5 | 89% |
+| `app/services/surge.py` | 28 | 0 | 100% |
+| `app/services/system_prompt.py` | 4 | 0 | 100% |
+| **TOTAL** | **1051** | **37** | **96%** |
 <!-- COVERAGE_END -->
 
 ## License
