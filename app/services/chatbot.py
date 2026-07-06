@@ -317,12 +317,19 @@ async def _run_tool(name: str, args: dict[str, Any]) -> str:
 # ── Public API ───────────────────────────────────────────────────────────────
 
 async def call_llm(prompt: str) -> str:
-    """Non-streaming call. Groq primary, Gemini fallback."""
+    """Non-streaming call. Groq primary, Gemini multi-model fallback."""
     try:
         return await _call_groq(prompt)
     except Exception as exc:
-        logger.warning("Groq failed (%s), trying Gemini fallback", exc)
-        return await _call_gemini(prompt)
+        logger.warning("Groq failed (%s), trying Gemini models", exc)
+    for model in _GEMINI_MODELS:
+        if _gemini_dead.get(model):
+            continue
+        try:
+            return await _call_gemini(prompt, model)
+        except Exception as exc:
+            logger.warning("Gemini %s failed (%s), trying next model", model, exc)
+    raise RuntimeError("All LLM providers failed")
 
 
 async def call_llm_fast(prompt: str) -> str:
@@ -335,8 +342,8 @@ async def call_llm_fast(prompt: str) -> str:
         )
         return resp.choices[0].message.content.strip()
     except Exception as exc:
-        logger.warning("Fast Groq failed (%s), falling back to quality model", exc)
-        return await _call_groq(prompt)
+        logger.warning("Fast Groq failed (%s), falling back to call_llm chain", exc)
+        return await call_llm(prompt)
 
 
 async def stream_llm(prompt: str) -> AsyncGenerator[str, None]:
@@ -475,27 +482,19 @@ async def _call_groq(prompt: str) -> str:
     return resp.choices[0].message.content.strip()
 
 
-async def _call_gemini(prompt: str) -> str:
+async def _call_gemini(prompt: str, model: str | None = None) -> str:
     if not settings.google_api_key:
         raise RuntimeError("Gemini fallback disabled: GOOGLE_API_KEY not set")
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=settings.google_api_key)
     clean = prompt.split("You have access to tools")[0].strip() if "You have access to tools" in prompt else prompt
-    model = _next_gemini_model() or _GEMINI_MODELS[-1]
-    resp = await asyncio.to_thread(
-        client.models.generate_content,
-        model=model,
-        contents=clean,
-        config=types.GenerateContentConfig(
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        ),
+    model = model or _next_gemini_model() or _GEMINI_MODELS[-1]
+    config = types.GenerateContentConfig(
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
-    try:
-        return resp.text
-    except Exception:
-        parts = resp.candidates[0].content.parts
-        return " ".join(p.text for p in parts if hasattr(p, "text") and p.text)
+    resp = await _gemini_generate(client, model, clean, config)
+    return _gemini_resp_text(resp)
 
 
 async def _stream_groq_with_tools(prompt: str) -> AsyncGenerator[str, None]:
@@ -629,10 +628,15 @@ async def _gemini_generate(client, model: str, contents, config):
             )
         except Exception as exc:
             exc_str = str(exc)
-            # Daily quota exhausted — mark this model dead for the process lifetime
-            if "PerDay" in exc_str or ("free_tier_requests" in exc_str and "limit: 0" in exc_str):
+            # Daily quota or invalid/leaked key — mark dead, skip this model permanently.
+            if (
+                "PerDay" in exc_str
+                or ("free_tier_requests" in exc_str and "limit: 0" in exc_str)
+                or ("403" in exc_str and "PERMISSION_DENIED" in exc_str)
+                or "leaked" in exc_str.lower()
+            ):
                 _gemini_dead[model] = True
-                logger.warning("Gemini %s daily quota exhausted — circuit breaker tripped", model)
+                logger.warning("Gemini %s permanently unavailable (%s) — circuit breaker tripped", model, exc_str[:120])
                 raise
             if attempt == 0:
                 if "503" in exc_str:

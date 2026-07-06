@@ -1,7 +1,15 @@
 import asyncio
 import pytest
+from unittest.mock import AsyncMock
 import app.main as main_module
 from app.main import lifespan, app as fastapi_app
+
+
+# All tests mock close_pool: the asyncpg pool may be bound to a different
+# function-scoped event loop from an earlier test, causing "Event loop is closed".
+@pytest.fixture(autouse=True)
+def mock_close_pool(mocker):
+    mocker.patch("app.db.close_pool", new=AsyncMock())
 
 
 async def test_lifespan_creates_consumer_task_on_startup(mocker):

@@ -81,7 +81,7 @@ async def test_call_gemini_passes_prompt_to_model(mocker):
     mocker.patch("google.genai.Client", return_value=mock_client)
     await _call_gemini("how many drivers?")
     call_kwargs = mock_client.models.generate_content.call_args.kwargs
-    assert call_kwargs["model"] == "gemini-2.0-flash"
+    assert call_kwargs["model"] == "gemini-2.5-flash"
     assert call_kwargs["contents"] == "how many drivers?"
 
 
@@ -365,7 +365,7 @@ async def test_gemini_generate_returns_on_success(mocker):
     mock_resp = MagicMock()
     mocker.patch("asyncio.to_thread", new=AsyncMock(return_value=mock_resp))
     client, config = MagicMock(), MagicMock()
-    result = await _gemini_generate(client, [], config)
+    result = await _gemini_generate(client, "test-model", [], config)
     assert result is mock_resp
 
 
@@ -374,7 +374,7 @@ async def test_gemini_generate_retries_on_503(mocker):
     mock_resp = MagicMock()
     mocker.patch("asyncio.to_thread",
                  new=AsyncMock(side_effect=[Exception("503 Service Unavailable"), mock_resp]))
-    result = await _gemini_generate(MagicMock(), [], MagicMock())
+    result = await _gemini_generate(MagicMock(), "test-model", [], MagicMock())
     assert result is mock_resp
 
 
@@ -386,7 +386,7 @@ async def test_gemini_generate_retries_on_short_429(mocker):
                      Exception("429 Too Many Requests retryDelay 5s"),
                      mock_resp,
                  ]))
-    result = await _gemini_generate(MagicMock(), [], MagicMock())
+    result = await _gemini_generate(MagicMock(), "test-model", [], MagicMock())
     assert result is mock_resp
 
 
@@ -395,7 +395,7 @@ async def test_gemini_generate_does_not_retry_on_long_429(mocker):
     mocker.patch("asyncio.to_thread",
                  new=AsyncMock(side_effect=Exception("429 Too Many Requests retryDelay 60s")))
     with pytest.raises(Exception, match="429"):
-        await _gemini_generate(MagicMock(), [], MagicMock())
+        await _gemini_generate(MagicMock(), "test-model", [], MagicMock())
 
 
 # ── _stream_groq_with_tools ───────────────────────────────────────────────────
@@ -460,7 +460,7 @@ async def test_call_groq_with_tools_records_tool_names(mocker):
 
 async def test_stream_gemini_unavailable_when_no_key(mocker):
     mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key=""))
-    frames = await _collect(_stream_gemini_with_tools("q"))
+    frames = await _collect(_stream_gemini_with_tools("q", "gemini-2.5-flash"))
     assert any("unavailable" in json.loads(f).get("token", "") for f in frames)
 
 
@@ -471,7 +471,7 @@ async def test_stream_gemini_direct_answer(mocker):
     mocker.patch("app.services.chatbot._get_gemini_tools", return_value=[])
     mock_resp = _make_gemini_resp_no_tools("Direct answer")
     mocker.patch("app.services.chatbot._gemini_generate", new=AsyncMock(return_value=mock_resp))
-    frames = await _collect(_stream_gemini_with_tools("q"))
+    frames = await _collect(_stream_gemini_with_tools("q", "gemini-2.5-flash"))
     assert any(json.loads(f).get("token") == "Direct answer" for f in frames)
 
 
@@ -485,7 +485,7 @@ async def test_stream_gemini_calls_tool_then_answers(mocker):
     resp_no_tools = _make_gemini_resp_no_tools("5 districts total")
     mocker.patch("app.services.chatbot._gemini_generate",
                  new=AsyncMock(side_effect=[resp_with_tools, resp_no_tools]))
-    frames = await _collect(_stream_gemini_with_tools("district summary"))
+    frames = await _collect(_stream_gemini_with_tools("district summary", "gemini-2.5-flash"))
     tool_frames = [f for f in frames if "tool" in json.loads(f)]
     assert tool_frames[0] == json.dumps({"tool": "get_all_districts_summary"})
     assert any("5 districts total" in json.loads(f).get("token", "") for f in frames)
@@ -496,7 +496,7 @@ async def test_stream_gemini_calls_tool_then_answers(mocker):
 async def test_call_gemini_raises_when_no_key(mocker):
     mocker.patch.object(chatbot_module, "settings", MagicMock(google_api_key=""))
     with pytest.raises(RuntimeError, match="unavailable"):
-        await _call_gemini_with_tools("q")
+        await _call_gemini_with_tools("q", "gemini-2.5-flash")
 
 
 async def test_call_gemini_with_tools_direct_answer(mocker):
@@ -506,7 +506,7 @@ async def test_call_gemini_with_tools_direct_answer(mocker):
     mocker.patch("app.services.chatbot._get_gemini_tools", return_value=[])
     mock_resp = _make_gemini_resp_no_tools("42 drivers")
     mocker.patch("app.services.chatbot._gemini_generate", new=AsyncMock(return_value=mock_resp))
-    answer, tools = await _call_gemini_with_tools("how many drivers?")
+    answer, tools = await _call_gemini_with_tools("how many drivers?", "gemini-2.5-flash")
     assert answer == "42 drivers"
     assert tools == []
 
@@ -521,7 +521,7 @@ async def test_call_gemini_with_tools_records_tool_names(mocker):
     resp2 = _make_gemini_resp_no_tools("answer")
     mocker.patch("app.services.chatbot._gemini_generate",
                  new=AsyncMock(side_effect=[resp1, resp2]))
-    answer, tools = await _call_gemini_with_tools("q")
+    answer, tools = await _call_gemini_with_tools("q", "gemini-2.5-flash")
     assert "query_postgres" in tools
     assert answer == "answer"
 
@@ -557,7 +557,7 @@ async def test_call_llm_with_tools_returns_error_when_both_fail(mocker):
 # ── stream_with_tools (facade) ────────────────────────────────────────────────
 
 async def test_stream_with_tools_gemini_success(mocker):
-    async def fake_gemini(prompt):
+    async def fake_gemini(prompt, model):
         yield json.dumps({"token": "gemini answer"})
 
     mocker.patch("app.services.chatbot._stream_gemini_with_tools", side_effect=fake_gemini)
@@ -781,7 +781,7 @@ async def test_stream_gemini_force_answer_after_loop_exhaustion(mocker):
     resp_final = _make_gemini_resp_no_tools("forced answer")
     mocker.patch("app.services.chatbot._gemini_generate",
                  new=AsyncMock(side_effect=[resp_with_tools] * 3 + [resp_final]))
-    frames = await _collect(_stream_gemini_with_tools("q"))
+    frames = await _collect(_stream_gemini_with_tools("q", "gemini-2.5-flash"))
     assert any("forced answer" in json.loads(f).get("token", "") for f in frames)
 
 
@@ -795,7 +795,7 @@ async def test_stream_gemini_force_answer_exception_yields_empty_token(mocker):
     resp_with_tools = _make_gemini_resp_with_tools("query_postgres", {"sql": "SELECT 1"})
     mocker.patch("app.services.chatbot._gemini_generate",
                  new=AsyncMock(side_effect=[resp_with_tools] * 3 + [Exception("force failed")]))
-    frames = await _collect(_stream_gemini_with_tools("q"))
+    frames = await _collect(_stream_gemini_with_tools("q", "gemini-2.5-flash"))
     assert any("token" in json.loads(f) for f in frames)
 
 
@@ -812,7 +812,7 @@ async def test_call_gemini_with_tools_force_answer_after_loop_exhaustion(mocker)
     resp_final = _make_gemini_resp_no_tools("final answer")
     mocker.patch("app.services.chatbot._gemini_generate",
                  new=AsyncMock(side_effect=[resp_with_tools] * 3 + [resp_final]))
-    answer, tools = await _call_gemini_with_tools("q")
+    answer, tools = await _call_gemini_with_tools("q", "gemini-2.5-flash")
     assert answer == "final answer"
 
 
@@ -826,7 +826,7 @@ async def test_call_gemini_with_tools_force_answer_exception_returns_empty(mocke
     resp_with_tools = _make_gemini_resp_with_tools("query_postgres", {"sql": "SELECT 1"})
     mocker.patch("app.services.chatbot._gemini_generate",
                  new=AsyncMock(side_effect=[resp_with_tools] * 3 + [Exception("force failed")]))
-    answer, tools = await _call_gemini_with_tools("q")
+    answer, tools = await _call_gemini_with_tools("q", "gemini-2.5-flash")
     assert answer == ""
     assert isinstance(tools, list)
 

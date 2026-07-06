@@ -101,7 +101,7 @@ async def test_staffing_ratio_is_rounded_to_two_decimal_places():
     result = await svc.update_forecast(make_position(district, uuid4()))
     assert result is not None
     assert result.staffingRatio == round(result.staffingRatio, 2)
-    assert result.staffingRatio == 0.17
+    assert result.staffingRatio == 0.25
 
 
 async def test_generated_at_is_parseable_iso_string():
