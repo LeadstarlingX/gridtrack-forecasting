@@ -81,13 +81,26 @@ def compress_context(ctx: dict, char_budget: int = _CONTEXT_CHAR_BUDGET) -> str:
 
 _PG_SCHEMA = """
 PostgreSQL tables (schema: public, double-quote all identifiers):
-- "Drivers": "DriverId" UUID PK, "Name" TEXT, "IsActive" BOOL, "DistrictId" TEXT, "LastSeen" TIMESTAMPTZ, "Location" GEOGRAPHY
-- "Deliveries": "DeliveryId" UUID PK, "DriverId" UUID FK->Drivers, "Status" TEXT (Pending/InTransit/Delivered/Cancelled), "DistrictId" TEXT, "AnomalyFlag" BOOL, "CreatedAt" TIMESTAMPTZ, "ExpectedEta" TIMESTAMPTZ, "ActualEta" TIMESTAMPTZ
-WARNING: There is NO "Districts" table. District names are not stored — only DistrictId (a text key) exists. Never query for district names.
-Rules: SELECT only. LIMIT 20. Double-quote identifiers. SELECT only the columns needed to answer the question — never SELECT *.
-IMPORTANT: For time arithmetic use make_interval() to avoid JSON escaping issues.
-Examples: NOW() - make_interval(hours => 1), NOW() - make_interval(days => 7).
-Single quotes in SQL do NOT need backslash-escaping inside JSON.
+- "Drivers": "DriverId" UUID PK, "Name" TEXT, "ShortName" TEXT, "IsActive" BOOL, "DistrictId" TEXT, "LastSeen" TIMESTAMPTZ
+- "Deliveries": "DeliveryId" UUID PK, "AssignedDriverId" UUID FK->Drivers, "Status" INTEGER, "DistrictId" TEXT, "AnomalyFlag" BOOL, "AnomalyReason" TEXT, "CreatedAt" TIMESTAMPTZ, "PickedUpAt" TIMESTAMPTZ, "DeliveredAt" TIMESTAMPTZ, "ExpectedEta" TIMESTAMPTZ, "UrgencyScore" INTEGER, "RouteDistanceMeters" FLOAT
+
+CRITICAL RULES (violations cause SQL errors):
+1. "Status" is INTEGER — NEVER use strings. Values: 0=Created 1=Assigned 2=PickedUp 3=InTransit 4=Delivered 5=Cancelled 6=Anomalous
+2. FK in "Deliveries" is "AssignedDriverId" — there is NO "DriverId" column in "Deliveries"
+3. No "Districts" table exists — only DistrictId text key
+4. Use double-quotes for identifiers, never backticks
+5. SELECT only needed columns. LIMIT 20. No SELECT *
+6. Time: make_interval(hours => 1), make_interval(days => 7)
+
+EXAMPLE QUERIES (copy the pattern exactly):
+- Active drivers: SELECT "DriverId", "Name", "DistrictId" FROM "Drivers" WHERE "IsActive" = true LIMIT 20
+- In-transit deliveries: SELECT "DeliveryId", "DistrictId", "AssignedDriverId" FROM "Deliveries" WHERE "Status" = 3 LIMIT 20
+- Delivered today: SELECT COUNT("DeliveryId") FROM "Deliveries" WHERE "Status" = 4 AND "DeliveredAt" >= NOW() - make_interval(hours => 24)
+- Anomalies: SELECT "DeliveryId", "DistrictId", "AnomalyReason" FROM "Deliveries" WHERE "AnomalyFlag" = true LIMIT 20
+- District delivery counts: SELECT "DistrictId", COUNT(*) FROM "Deliveries" WHERE "Status" = 4 GROUP BY "DistrictId" ORDER BY COUNT(*) DESC LIMIT 10
+- Driver with their deliveries: SELECT d."DriverId", d."Name", COUNT(del."DeliveryId") FROM "Drivers" d LEFT JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" GROUP BY d."DriverId", d."Name" LIMIT 20
+- Best drivers today (most deliveries completed on time): SELECT d."Name", COUNT(del."DeliveryId") AS completed FROM "Drivers" d JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" WHERE del."Status" = 4 AND del."DeliveredAt" >= NOW() - make_interval(hours => 24) GROUP BY d."DriverId", d."Name" ORDER BY completed DESC LIMIT 5
+- On-time drivers (delivered before ETA): SELECT d."Name", COUNT(del."DeliveryId") AS on_time FROM "Drivers" d JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" WHERE del."Status" = 4 AND del."DeliveredAt" IS NOT NULL AND del."ExpectedEta" IS NOT NULL AND del."DeliveredAt" <= del."ExpectedEta" GROUP BY d."DriverId", d."Name" ORDER BY on_time DESC LIMIT 5
 """
 
 _CH_SCHEMA = """
@@ -172,6 +185,22 @@ _TOOLS: list[dict[str, Any]] = [
 
 _MAX_RESULT_CHARS = 3_000  # ~750 tokens per tool call
 
+# Delivery status names → integer values (Groq llama often generates string comparisons)
+_STATUS_INTS = {"Created": 0, "Assigned": 1, "PickedUp": 2,
+                "InTransit": 3, "Delivered": 4, "Cancelled": 5, "Anomalous": 6}
+
+def _fix_pg_sql(sql: str) -> str:
+    """Auto-correct common LLM SQL mistakes before sending to PostgreSQL."""
+    import re
+    # Replace "Status" = 'Name' or "Status" = "Name" with integer value
+    def _replace_status(m):
+        name = m.group(1)
+        return f'"Status" = {_STATUS_INTS.get(name, m.group(0))}'
+    sql = re.sub(r'"Status"\s*=\s*[\'"](\w+)[\'"]', _replace_status, sql)
+    # Replace backtick identifiers with double-quote
+    sql = re.sub(r'`([^`]+)`', r'"\1"', sql)
+    return sql
+
 def _trim_result(result: str) -> str:
     if len(result) <= _MAX_RESULT_CHARS:
         return result
@@ -186,8 +215,23 @@ _GEMINI_SYSTEM = (
     "IMPORTANT: Call at most 2-3 tools per question. If a tool returns empty or zero results, accept that and answer directly — do not call more tools to verify."
 )
 
+# Ordered Gemini models to try — primary first, fallback chain after.
+# Verify API IDs against Google AI Studio if names change.
+_GEMINI_MODELS = [
+    "gemini-2.5-flash",       # Gemini 2.5 Flash  (best quality, 20 RPD free)
+    "gemini-2.0-flash",       # Gemini 2.0 Flash  (current workhorse)
+    "gemini-2.0-flash-lite",  # Gemini Flash Lite (high RPD, lighter model)
+]
+
 # Lazy-cached Gemini tool list (avoids importing google.genai at startup)
 _gemini_tools_cache: list | None = None
+# Per-model circuit-breakers: True when a model's daily quota is exhausted.
+_gemini_dead: dict[str, bool] = {}
+
+
+def _next_gemini_model() -> str | None:
+    """Return the first Gemini model that hasn't hit its daily quota, or None."""
+    return next((m for m in _GEMINI_MODELS if not _gemini_dead.get(m)), None)
 
 
 def _get_gemini_tools() -> list:
@@ -237,6 +281,7 @@ async def _run_tool(name: str, args: dict[str, Any]) -> str:
         sql = args.get("sql", "").strip()
         if not sql.upper().startswith("SELECT"):
             return json.dumps({"error": "Only SELECT statements are allowed"})
+        sql = _fix_pg_sql(sql)
         from app.db import get_pool
         pool = await get_pool()
         try:
@@ -343,9 +388,11 @@ def _recover_tool_calls(exc: Exception) -> list[tuple[str, dict]] | None:
     if not failed:
         return None
     fixed = failed.replace("\\'", "'")
-    # Handles: name/>, name{}, name[]{}, name={}, name={"sql":...}>, </function> endings
+    # Handles: name/>, name{}, name={}, name={"sql":...}></function> endings
+    # The [>\s]* after the JSON handles the `>` that closes the opening element tag
+    # before the </function> closing tag in the format: <function=name,{...}></function>
     matches = re.findall(
-        r"<function=(\w+)[\[\]\s,=]*((?:\{.*?\})?)\s*(?:/>|</function>)",
+        r"<function=(\w+)[\[\]\s,=]*((?:\{.*?\})?)[>\s]*(?:/>|</function>)",
         fixed,
         re.DOTALL,
     )
@@ -364,26 +411,30 @@ def _recover_tool_calls(exc: Exception) -> list[tuple[str, dict]] | None:
 
 
 async def stream_with_tools(prompt: str) -> AsyncGenerator[str, None]:
-    """Streaming with tool calling. Gemini primary, Groq fallback.
+    """Streaming with tool calling. Gemini chain primary, Groq fallback.
 
     Yields JSON-encoded frames:
       {"tool": "name"}       — emitted when a tool is called
       {"token": "text..."}   — final answer
     """
-    got_answer = False
-    try:
-        async for frame in _stream_gemini_with_tools(prompt):
-            yield frame
-            if not got_answer:
-                try:
-                    got_answer = bool(json.loads(frame).get("token"))
-                except (json.JSONDecodeError, AttributeError):
-                    pass
-        if got_answer:
-            return
-        logger.warning("Gemini returned empty answer, falling back to Groq")
-    except Exception as gemini_exc:
-        logger.warning("Gemini primary failed (%s), falling back to Groq", gemini_exc)
+    # Try each live Gemini model in order before falling back to Groq.
+    for model in _GEMINI_MODELS:
+        if _gemini_dead.get(model):
+            continue
+        got_answer = False
+        try:
+            async for frame in _stream_gemini_with_tools(prompt, model):
+                yield frame
+                if not got_answer:
+                    try:
+                        got_answer = bool(json.loads(frame).get("token"))
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+            if got_answer:
+                return
+            logger.warning("Gemini %s returned empty answer, trying next model", model)
+        except Exception as exc:
+            logger.warning("Gemini %s failed (%s), trying next model", model, exc)
 
     try:
         async for frame in _stream_groq_with_tools(prompt):
@@ -394,14 +445,17 @@ async def stream_with_tools(prompt: str) -> AsyncGenerator[str, None]:
 
 
 async def call_llm_with_tools(prompt: str) -> tuple[str, list[str]]:
-    """Tool-calling loop. Gemini primary, Groq fallback. Returns (answer, tools_used)."""
-    try:
-        answer, tools_used = await _call_gemini_with_tools(prompt)
-        if answer:
-            return answer, tools_used
-        logger.warning("Gemini returned empty answer, falling back to Groq")
-    except Exception as gemini_exc:
-        logger.warning("Gemini primary failed (%s), falling back to Groq", gemini_exc)
+    """Tool-calling loop. Gemini chain primary, Groq fallback. Returns (answer, tools_used)."""
+    for model in _GEMINI_MODELS:
+        if _gemini_dead.get(model):
+            continue
+        try:
+            answer, tools_used = await _call_gemini_with_tools(prompt, model)
+            if answer:
+                return answer, tools_used
+            logger.warning("Gemini %s returned empty answer, trying next model", model)
+        except Exception as exc:
+            logger.warning("Gemini %s failed (%s), trying next model", model, exc)
 
     try:
         return await _call_groq_with_tools(prompt)
@@ -428,9 +482,10 @@ async def _call_gemini(prompt: str) -> str:
     from google.genai import types
     client = genai.Client(api_key=settings.google_api_key)
     clean = prompt.split("You have access to tools")[0].strip() if "You have access to tools" in prompt else prompt
+    model = _next_gemini_model() or _GEMINI_MODELS[-1]
     resp = await asyncio.to_thread(
         client.models.generate_content,
-        model="gemini-2.0-flash",
+        model=model,
         contents=clean,
         config=types.GenerateContentConfig(
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
@@ -556,21 +611,32 @@ async def _call_groq_with_tools(prompt: str) -> tuple[str, list[str]]:
     return (msg.content or "").strip() if msg else "", tools_used
 
 
-async def _gemini_generate(client, contents, config):
-    """Call Gemini with auto-retry on 503 and short 429 delays (≤ 30 s)."""
+async def _gemini_generate(client, model: str, contents, config):
+    """Call Gemini with auto-retry on 503 and short 429 delays (≤ 30 s).
+    Sets _gemini_dead[model] on daily quota exhaustion so the circuit-breaker
+    skips that model and tries the next one in the fallback chain.
+    """
+    global _gemini_dead
+    if _gemini_dead.get(model):
+        raise RuntimeError(f"Gemini {model} daily quota exhausted — skipping")
     for attempt in range(2):
         try:
             return await asyncio.to_thread(
                 client.models.generate_content,
-                model="gemini-2.0-flash",
+                model=model,
                 contents=contents,
                 config=config,
             )
         except Exception as exc:
             exc_str = str(exc)
+            # Daily quota exhausted — mark this model dead for the process lifetime
+            if "PerDay" in exc_str or ("free_tier_requests" in exc_str and "limit: 0" in exc_str):
+                _gemini_dead[model] = True
+                logger.warning("Gemini %s daily quota exhausted — circuit breaker tripped", model)
+                raise
             if attempt == 0:
                 if "503" in exc_str:
-                    logger.warning("Gemini 503, retrying in 2 s…")
+                    logger.warning("Gemini %s 503, retrying in 2 s…", model)
                     await asyncio.sleep(2)
                     continue
                 if "429" in exc_str:
@@ -578,7 +644,7 @@ async def _gemini_generate(client, contents, config):
                     m = _re.search(r"retryDelay.*?(\d+)s", exc_str)
                     wait = int(m.group(1)) if m else 0
                     if 0 < wait <= 30:
-                        logger.warning("Gemini 429, retrying in %d s…", wait)
+                        logger.warning("Gemini %s 429, retrying in %d s…", model, wait)
                         await asyncio.sleep(wait)
                         continue
             raise
@@ -601,8 +667,8 @@ def _gemini_resp_text(resp) -> str:
         return " ".join(p.text for p in parts if hasattr(p, "text") and p.text)
 
 
-async def _stream_gemini_with_tools(prompt: str) -> AsyncGenerator[str, None]:
-    """Gemini primary streaming with full tool access."""
+async def _stream_gemini_with_tools(prompt: str, model: str) -> AsyncGenerator[str, None]:
+    """Gemini streaming with full tool access (single model)."""
     if not settings.google_api_key:
         yield json.dumps({"token": "Gemini unavailable: GOOGLE_API_KEY not set."})
         return
@@ -618,7 +684,7 @@ async def _stream_gemini_with_tools(prompt: str) -> AsyncGenerator[str, None]:
     contents: list = [types.Content(role="user", parts=[types.Part(text=_user_content(prompt))])]
 
     for _ in range(3):
-        resp = await _gemini_generate(client, contents, config)
+        resp = await _gemini_generate(client, model, contents, config)
         candidate = resp.candidates[0]
         fn_calls = [p.function_call for p in candidate.content.parts
                     if hasattr(p, "function_call") and p.function_call]
@@ -647,14 +713,14 @@ async def _stream_gemini_with_tools(prompt: str) -> AsyncGenerator[str, None]:
         parts=[types.Part(text="Based on the data collected, give a direct answer now. Do not call any more tools.")],
     ))
     try:
-        resp = await _gemini_generate(client, contents, config)
+        resp = await _gemini_generate(client, model, contents, config)
         yield json.dumps({"token": _gemini_resp_text(resp)})
     except Exception:
         yield json.dumps({"token": ""})
 
 
-async def _call_gemini_with_tools(prompt: str) -> tuple[str, list[str]]:
-    """Gemini primary non-streaming with full tool access."""
+async def _call_gemini_with_tools(prompt: str, model: str) -> tuple[str, list[str]]:
+    """Gemini non-streaming with full tool access (single model)."""
     if not settings.google_api_key:
         raise RuntimeError("Gemini unavailable: GOOGLE_API_KEY not set")
     from google import genai
@@ -670,7 +736,7 @@ async def _call_gemini_with_tools(prompt: str) -> tuple[str, list[str]]:
     tools_used: list[str] = []
 
     for _ in range(3):
-        resp = await _gemini_generate(client, contents, config)
+        resp = await _gemini_generate(client, model, contents, config)
         candidate = resp.candidates[0]
         fn_calls = [p.function_call for p in candidate.content.parts
                     if hasattr(p, "function_call") and p.function_call]
@@ -698,7 +764,7 @@ async def _call_gemini_with_tools(prompt: str) -> tuple[str, list[str]]:
         parts=[types.Part(text="Based on the data collected, give a direct answer now. Do not call any more tools.")],
     ))
     try:
-        resp = await _gemini_generate(client, contents, config)
+        resp = await _gemini_generate(client, model, contents, config)
         return _gemini_resp_text(resp), tools_used
     except Exception:
         return "", tools_used

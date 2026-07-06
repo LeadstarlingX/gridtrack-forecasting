@@ -6,7 +6,6 @@ Transport: Streamable HTTP (SSE).
 """
 
 import json
-from datetime import timedelta
 
 from mcp.server.fastmcp import FastMCP
 
@@ -126,9 +125,9 @@ async def get_stalled_drivers(minutes: int = 15) -> str:
     rows = await pool.fetch(
         'SELECT "DriverId", "Name", "DistrictId", "LastSeen"'
         ' FROM public."Drivers"'
-        ' WHERE "IsActive" = true AND "LastSeen" < NOW() - $1'
+        ' WHERE "IsActive" = true AND "LastSeen" < NOW() - make_interval(mins => $1)'
         ' ORDER BY "LastSeen" ASC LIMIT 20',
-        timedelta(minutes=minutes),
+        minutes,
     )
     return json.dumps([dict(r) for r in rows], default=str)
 

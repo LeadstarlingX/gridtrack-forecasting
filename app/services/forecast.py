@@ -1,11 +1,24 @@
-import logging
-from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
+"""Delivery demand forecasting.
 
+Real-time per-district staffing ratio via a SARIMA model fitted on
+historical hourly delivery counts from Postgres (cache refreshed hourly).
+Falls back to the naive count×2 extrapolation when history is too sparse.
+
+Global (system-wide) SARIMA forecast powers the KPI delivery trend chart.
+"""
+
+import asyncio
+import logging
+import os
+from collections import defaultdict, deque
+from datetime import datetime, date, timedelta, timezone
+
+from app.db import get_pool
 from app.models import DriverPositionIntegrationEvent, ForecastResultMessage
 
 logger = logging.getLogger(__name__)
 
+# ── Real-time sliding window (per-district) ───────────────────────────────────
 _windows: dict[str, deque[datetime]] = defaultdict(deque)
 _active_drivers: dict[str, set[str]] = defaultdict(set)
 _last_emit: dict[str, datetime] = {}
@@ -15,10 +28,19 @@ EMIT_INTERVAL = timedelta(minutes=5)
 CRITICAL_RATIO = 0.70
 MODERATE_RATIO = 0.85
 
+# ── SARIMA cache ──────────────────────────────────────────────────────────────
+# Keyed by district → (expected_count, fitted_at).
+# Re-fitted at most once per hour to avoid blocking the consumer loop.
+_sarima_cache: dict[str, tuple[float, datetime]] = {}
+SARIMA_TTL = timedelta(hours=1)
+SARIMA_MIN_POINTS = 48  # 2 full seasonal periods (s=24 hours)
+# 0 = no cap; set SARIMA_DAILY_CAP env var to limit sim-inflated predictions
+SARIMA_DAILY_CAP: float = float(os.getenv("SARIMA_DAILY_CAP", "0"))
 
-async def update_forecast(
-    event: DriverPositionIntegrationEvent,
-) -> ForecastResultMessage | None:
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+async def update_forecast(event: DriverPositionIntegrationEvent) -> ForecastResultMessage | None:
     now = datetime.now(timezone.utc)
     district = event.districtId
 
@@ -32,10 +54,7 @@ async def update_forecast(
     if not _should_emit(district, now):
         return None
 
-    half_cutoff = now - timedelta(minutes=30)
-    count_last_30 = sum(1 for t in _windows[district] if t >= half_cutoff)
-    expected = count_last_30 * 2
-
+    expected = await _get_expected(district)
     driver_count = len(_active_drivers[district])
     ratio = driver_count / expected if expected > 0 else 1.0
 
@@ -47,7 +66,7 @@ async def update_forecast(
         label, color = "Low demand", "#34d399"
 
     logger.info(
-        "Forecast %s: expected=%d drivers=%d ratio=%.2f label=%s",
+        "Forecast %s: expected=%.1f drivers=%d ratio=%.2f label=%s",
         district, expected, driver_count, ratio, label,
     )
 
@@ -65,9 +84,132 @@ def release_driver(district: str, driver_id: str) -> None:
     _active_drivers[district].discard(driver_id)
 
 
+async def sarima_forecast_global(days: int = 3) -> list[dict]:
+    """System-wide SARIMA delivery count forecast aggregated to daily buckets.
+
+    Fits SARIMAX(1,1,1)(1,1,1,24) on the last 14 days of hourly delivery counts
+    and returns `days` daily predicted totals as {bucket, value} dicts.
+    Falls back to a 7-day rolling daily average when history is too sparse.
+    """
+    try:
+        pool = await get_pool()
+        rows = await pool.fetch(
+            """
+            SELECT date_trunc('hour', "CreatedAt" AT TIME ZONE 'UTC') AS hr,
+                   COUNT(*)::float                                      AS cnt
+            FROM   "Deliveries"
+            WHERE  "CreatedAt" >= NOW() - INTERVAL '14 days'
+            GROUP  BY 1
+            ORDER  BY 1
+            """,
+        )
+        if not rows:
+            return []
+
+        counts = [float(r["cnt"]) for r in rows]
+        last_hr: datetime = rows[-1]["hr"]
+        if last_hr.tzinfo is None:
+            last_hr = last_hr.replace(tzinfo=timezone.utc)
+        base_day: date = (last_hr + timedelta(hours=1)).date()
+
+        if len(counts) < SARIMA_MIN_POINTS:
+            daily_avg = sum(counts) / max(1, len(counts)) * 24
+            return [
+                {"bucket": (base_day + timedelta(days=i)).isoformat(), "value": round(daily_avg, 1)}
+                for i in range(days)
+            ]
+
+        hourly_preds = await asyncio.get_running_loop().run_in_executor(
+            None, _fit_and_predict, counts, days * 24
+        )
+
+        # Anchor the forecast level to the 7-day trailing average so the prediction
+        # line starts where the historical chart ends — preserves SARIMA's trend
+        # direction/shape without inheriting long-run sim-inflated bias.
+        trailing_window = min(7 * 24, len(counts))
+        trailing_daily = sum(counts[-trailing_window:]) / max(1, trailing_window / 24)
+        day0_raw = sum(hourly_preds[:24])
+        scale = trailing_daily / day0_raw if day0_raw > 0 else 1.0
+
+        return [
+            {
+                "bucket": (base_day + timedelta(days=d)).isoformat(),
+                "value": round(sum(hourly_preds[d * 24 : (d + 1) * 24]) * scale, 1),
+            }
+            for d in range(days)
+        ]
+
+    except Exception as exc:
+        logger.warning("SARIMA global forecast failed: %s", exc)
+        return []
+
+
+# ── Private helpers ───────────────────────────────────────────────────────────
+
 def _should_emit(district: str, now: datetime) -> bool:
     last = _last_emit.get(district)
     if last is None or (now - last) >= EMIT_INTERVAL:
         _last_emit[district] = now
         return True
     return False
+
+
+async def _get_expected(district: str) -> float:
+    """Return SARIMA-predicted expected deliveries for the next hour (cached hourly)."""
+    cached = _sarima_cache.get(district)
+    if cached and (datetime.now(timezone.utc) - cached[1]) < SARIMA_TTL:
+        return cached[0]
+    return await _refit_district(district)
+
+
+async def _refit_district(district: str) -> float:
+    try:
+        pool = await get_pool()
+        rows = await pool.fetch(
+            """
+            SELECT date_trunc('hour', "CreatedAt" AT TIME ZONE 'UTC') AS hr,
+                   COUNT(*)::float                                      AS cnt
+            FROM   "Deliveries"
+            WHERE  "DistrictId" = $1
+              AND  "CreatedAt" >= NOW() - INTERVAL '14 days'
+            GROUP  BY 1
+            ORDER  BY 1
+            """,
+            district,
+        )
+        counts = [float(r["cnt"]) for r in rows]
+
+        if len(counts) < SARIMA_MIN_POINTS:
+            fallback = (counts[-1] * 2) if counts else 4.0
+            _sarima_cache[district] = (fallback, datetime.now(timezone.utc))
+            return fallback
+
+        expected = await asyncio.get_running_loop().run_in_executor(
+            None, _fit_and_predict, counts, 1
+        )
+        value = expected[0]
+        _sarima_cache[district] = (value, datetime.now(timezone.utc))
+        logger.info("SARIMA refit district=%s expected=%.1f", district, value)
+        return value
+
+    except Exception as exc:
+        logger.warning("SARIMA district refit failed (%s): %s", district, exc)
+        stale = _sarima_cache.get(district)
+        return stale[0] if stale else 4.0
+
+
+def _fit_and_predict(counts: list[float], steps: int) -> list[float]:
+    """Synchronous SARIMA fit — must be called via run_in_executor."""
+    from statsmodels.tsa.statespace.sarimax import SARIMAX  # lazy import
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = SARIMAX(
+            counts,
+            order=(1, 1, 1),
+            seasonal_order=(1, 1, 1, 24),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+        fit = model.fit(disp=False, maxiter=50)
+    return [max(0.0, float(v)) for v in fit.forecast(steps=steps)]

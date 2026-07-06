@@ -151,6 +151,20 @@ async def transcribe(file: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="Transcription service unavailable")
 
 
+# ── Delivery trend SARIMA forecast ──────────────────────────────────────────
+
+@app.get("/forecast/delivery-trend")
+async def delivery_trend_forecast(days: int = 3):
+    """SARIMA-based system-wide delivery count forecast, aggregated by day.
+
+    Returns `days` daily predictions as [{bucket, value}] where bucket is an
+    ISO date string (UTC) and value is the predicted total delivery count for
+    that day.
+    """
+    from app.services.forecast import sarima_forecast_global
+    return {"forecast": await sarima_forecast_global(days=min(days, 14))}
+
+
 # ── MCP server (external agent access) ──────────────────────────────────────
 
 from app.config import settings as _settings

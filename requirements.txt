@@ -10,3 +10,4 @@ asyncpg>=0.29.0
 mcp>=1.0.0
 clickhouse-connect>=0.7.0
 fpdf2>=2.7.0
+statsmodels>=0.14.0
