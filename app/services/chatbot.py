@@ -19,6 +19,7 @@ from typing import Any
 
 from groq import AsyncGroq
 
+from app.auth import scope_pg_sql
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -249,7 +250,7 @@ def _get_gemini_tools() -> list:
     return _gemini_tools_cache
 
 
-async def _run_tool(name: str, args: dict[str, Any]) -> str:
+async def _run_tool(name: str, args: dict[str, Any], allowed_districts: list[str] | None = None) -> str:
     from datetime import datetime, timezone
     from app.services.forecast import _windows, _active_drivers  # live in-memory state
 
@@ -282,6 +283,7 @@ async def _run_tool(name: str, args: dict[str, Any]) -> str:
         if not sql.upper().startswith("SELECT"):
             return json.dumps({"error": "Only SELECT statements are allowed"})
         sql = _fix_pg_sql(sql)
+        sql = scope_pg_sql(sql, allowed_districts)
         from app.db import get_pool
         pool = await get_pool()
         try:
@@ -417,7 +419,7 @@ def _recover_tool_calls(exc: Exception) -> list[tuple[str, dict]] | None:
     return result or None
 
 
-async def stream_with_tools(prompt: str) -> AsyncGenerator[str, None]:
+async def stream_with_tools(prompt: str, allowed_districts: list[str] | None = None) -> AsyncGenerator[str, None]:
     """Streaming with tool calling. Gemini chain primary, Groq fallback.
 
     Yields JSON-encoded frames:
@@ -430,7 +432,7 @@ async def stream_with_tools(prompt: str) -> AsyncGenerator[str, None]:
             continue
         got_answer = False
         try:
-            async for frame in _stream_gemini_with_tools(prompt, model):
+            async for frame in _stream_gemini_with_tools(prompt, model, allowed_districts):
                 yield frame
                 if not got_answer:
                     try:
@@ -444,20 +446,20 @@ async def stream_with_tools(prompt: str) -> AsyncGenerator[str, None]:
             logger.warning("Gemini %s failed (%s), trying next model", model, exc)
 
     try:
-        async for frame in _stream_groq_with_tools(prompt):
+        async for frame in _stream_groq_with_tools(prompt, allowed_districts):
             yield frame
     except Exception as groq_exc:
         logger.warning("Groq fallback also failed (%s)", groq_exc)
         yield json.dumps({"token": "Both AI providers are temporarily unavailable. Please try again in a moment."})
 
 
-async def call_llm_with_tools(prompt: str) -> tuple[str, list[str]]:
+async def call_llm_with_tools(prompt: str, allowed_districts: list[str] | None = None) -> tuple[str, list[str]]:
     """Tool-calling loop. Gemini chain primary, Groq fallback. Returns (answer, tools_used)."""
     for model in _GEMINI_MODELS:
         if _gemini_dead.get(model):
             continue
         try:
-            answer, tools_used = await _call_gemini_with_tools(prompt, model)
+            answer, tools_used = await _call_gemini_with_tools(prompt, model, allowed_districts)
             if answer:
                 return answer, tools_used
             logger.warning("Gemini %s returned empty answer, trying next model", model)
@@ -465,7 +467,7 @@ async def call_llm_with_tools(prompt: str) -> tuple[str, list[str]]:
             logger.warning("Gemini %s failed (%s), trying next model", model, exc)
 
     try:
-        return await _call_groq_with_tools(prompt)
+        return await _call_groq_with_tools(prompt, allowed_districts)
     except Exception as groq_exc:
         logger.warning("Groq fallback also failed (%s)", groq_exc)
         return "Both AI providers are temporarily unavailable. Please try again in a moment.", []
@@ -497,7 +499,7 @@ async def _call_gemini(prompt: str, model: str | None = None) -> str:
     return _gemini_resp_text(resp)
 
 
-async def _stream_groq_with_tools(prompt: str) -> AsyncGenerator[str, None]:
+async def _stream_groq_with_tools(prompt: str, allowed_districts: list[str] | None = None) -> AsyncGenerator[str, None]:
     """Groq tool-calling streaming loop (fallback)."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     msg = None
@@ -538,7 +540,7 @@ async def _stream_groq_with_tools(prompt: str) -> AsyncGenerator[str, None]:
         for tc in msg.tool_calls:
             yield json.dumps({"tool": tc.function.name})
             args   = json.loads(tc.function.arguments or "{}") or {}
-            result = await _run_tool(tc.function.name, args)
+            result = await _run_tool(tc.function.name, args, allowed_districts)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     # Loop exhausted with tool context — force a final answer
@@ -554,7 +556,7 @@ async def _stream_groq_with_tools(prompt: str) -> AsyncGenerator[str, None]:
     yield json.dumps({"token": (msg.content or "").strip() if msg else ""})
 
 
-async def _call_groq_with_tools(prompt: str) -> tuple[str, list[str]]:
+async def _call_groq_with_tools(prompt: str, allowed_districts: list[str] | None = None) -> tuple[str, list[str]]:
     """Groq tool-calling loop (fallback). Returns (answer, tools_used)."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     tools_used: list[str] = []
@@ -578,7 +580,7 @@ async def _call_groq_with_tools(prompt: str) -> tuple[str, list[str]]:
             messages.append({"role": "assistant", "content": None, "tool_calls": fake_payload})
             for i, (name, args) in enumerate(recovered):
                 tools_used.append(name)
-                result = await _run_tool(name, args)
+                result = await _run_tool(name, args, allowed_districts)
                 messages.append({"role": "tool", "tool_call_id": f"r{i}", "content": result})
             continue
 
@@ -671,7 +673,7 @@ def _gemini_resp_text(resp) -> str:
         return " ".join(p.text for p in parts if hasattr(p, "text") and p.text)
 
 
-async def _stream_gemini_with_tools(prompt: str, model: str) -> AsyncGenerator[str, None]:
+async def _stream_gemini_with_tools(prompt: str, model: str, allowed_districts: list[str] | None = None) -> AsyncGenerator[str, None]:
     """Gemini streaming with full tool access (single model)."""
     if not settings.google_api_key:
         yield json.dumps({"token": "Gemini unavailable: GOOGLE_API_KEY not set."})
@@ -702,7 +704,7 @@ async def _stream_gemini_with_tools(prompt: str, model: str) -> AsyncGenerator[s
         for fc in fn_calls:
             yield json.dumps({"tool": fc.name})
             args = dict(fc.args) if fc.args else {}
-            result = await _run_tool(fc.name, args)
+            result = await _run_tool(fc.name, args, allowed_districts)
             tool_parts.append(types.Part(
                 function_response=types.FunctionResponse(
                     name=fc.name,
@@ -723,7 +725,7 @@ async def _stream_gemini_with_tools(prompt: str, model: str) -> AsyncGenerator[s
         yield json.dumps({"token": ""})
 
 
-async def _call_gemini_with_tools(prompt: str, model: str) -> tuple[str, list[str]]:
+async def _call_gemini_with_tools(prompt: str, model: str, allowed_districts: list[str] | None = None) -> tuple[str, list[str]]:
     """Gemini non-streaming with full tool access (single model)."""
     if not settings.google_api_key:
         raise RuntimeError("Gemini unavailable: GOOGLE_API_KEY not set")
@@ -753,7 +755,7 @@ async def _call_gemini_with_tools(prompt: str, model: str) -> tuple[str, list[st
         for fc in fn_calls:
             tools_used.append(fc.name)
             args = dict(fc.args) if fc.args else {}
-            result = await _run_tool(fc.name, args)
+            result = await _run_tool(fc.name, args, allowed_districts)
             tool_parts.append(types.Part(
                 function_response=types.FunctionResponse(
                     name=fc.name,

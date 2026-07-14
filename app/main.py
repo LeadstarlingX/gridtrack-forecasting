@@ -84,12 +84,12 @@ async def chat_stream_post(body: ChatBody):
     return _stream_response(body.question, body.context)
 
 
-def _stream_response(question: str, ctx: dict):
+def _stream_response(question: str, ctx: dict, allowed_districts: list[str] | None):
     prompt = build_prompt(question, ctx)
 
     async def event_generator():
         try:
-            async for frame in stream_with_tools(prompt):
+            async for frame in stream_with_tools(prompt, allowed_districts=allowed_districts):
                 yield f"data: {frame}\n\n"
         except Exception as exc:
             logger.warning("Streaming error: %s", exc)
