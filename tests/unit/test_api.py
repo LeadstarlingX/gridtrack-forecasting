@@ -58,7 +58,7 @@ async def test_chat_returns_llm_answer(client, mocker):
 async def test_chat_prompt_includes_question_and_context(client, mocker):
     captured: dict = {}
 
-    async def capture_llm(prompt: str) -> tuple[str, list[str]]:
+    async def capture_llm(prompt: str, allowed_districts=None) -> tuple[str, list[str]]:
         captured["prompt"] = prompt
         return ("ok", [])
 
@@ -263,7 +263,7 @@ async def test_staffing_markdown_fenced_json_is_accepted(client, mocker):
 
 
 async def test_chat_stream_post_returns_sse_content_type(client, mocker):
-    async def fake_stream(_prompt: str):
+    async def fake_stream(_prompt: str, allowed_districts=None):
         yield '{"token": "hello"}'
 
     mocker.patch("app.main.stream_with_tools", side_effect=fake_stream)
@@ -276,7 +276,7 @@ async def test_chat_stream_post_returns_sse_content_type(client, mocker):
 
 
 async def test_chat_stream_post_emits_token_events_and_done(client, mocker):
-    async def fake_stream(_prompt: str):
+    async def fake_stream(_prompt: str, allowed_districts=None):
         for token in ["Hello", " world"]:
             yield f'{{"token": "{token}"}}'
 
@@ -293,7 +293,7 @@ async def test_chat_stream_post_emits_token_events_and_done(client, mocker):
 
 
 async def test_chat_stream_get_returns_sse_via_query_params(client, mocker):
-    async def fake_stream(_prompt: str):
+    async def fake_stream(_prompt: str, allowed_districts=None):
         yield '{"token": "ok"}'
 
     mocker.patch("app.main.stream_with_tools", side_effect=fake_stream)
@@ -304,7 +304,7 @@ async def test_chat_stream_get_returns_sse_via_query_params(client, mocker):
 
 
 async def test_chat_stream_done_terminator_present_after_error(client, mocker):
-    async def failing_stream(_prompt: str):
+    async def failing_stream(_prompt: str, allowed_districts=None):
         yield '{"token": "partial"}'
         raise RuntimeError("Network error mid-stream")
 
@@ -324,7 +324,7 @@ async def test_chat_stream_missing_question_returns_422(client):
 
 async def test_chat_stream_get_invalid_json_context_falls_back_to_empty(client, mocker):
     """Lines 76-77: invalid JSON in context param → ctx = {} (no error)."""
-    async def fake_stream(_prompt: str):
+    async def fake_stream(_prompt: str, allowed_districts=None):
         yield '{"token": "ok"}'
 
     mocker.patch("app.main.stream_with_tools", side_effect=fake_stream)
