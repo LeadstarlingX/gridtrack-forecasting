@@ -123,35 +123,41 @@ async def test_invalid_token_raises_401():
 # ── _run_tool SQL scoping ─────────────────────────────────────────────────────
 
 async def test_run_tool_applies_district_filter_for_observer():
-    from app.services.chatbot import _run_tool
+    from app.services.chatbot import _run_tool, _allowed_districts_ctx
 
-    mock_pool = MagicMock()
-    mock_pool.fetch = AsyncMock(return_value=[])
+    tok = _allowed_districts_ctx.set(["mezzeh"])
+    try:
+        mock_pool = MagicMock()
+        mock_pool.fetch = AsyncMock(return_value=[])
 
-    with patch("app.db.get_pool", new=AsyncMock(return_value=mock_pool)):
-        await _run_tool(
-            "query_postgres",
-            {"sql": 'SELECT "DeliveryId" FROM "Deliveries" LIMIT 10'},
-            allowed_districts=["mezzeh"],
-        )
+        with patch("app.db.get_pool", new=AsyncMock(return_value=mock_pool)):
+            await _run_tool(
+                "query_postgres",
+                {"sql": 'SELECT "DeliveryId" FROM "Deliveries" LIMIT 10'},
+            )
 
-    executed_sql = mock_pool.fetch.call_args[0][0]
-    assert "__rbac" in executed_sql
-    assert "'mezzeh'" in executed_sql
+        executed_sql = mock_pool.fetch.call_args[0][0]
+        assert "__rbac" in executed_sql
+        assert "'mezzeh'" in executed_sql
+    finally:
+        _allowed_districts_ctx.reset(tok)
 
 
 async def test_run_tool_no_filter_for_general_observer():
-    from app.services.chatbot import _run_tool
+    from app.services.chatbot import _run_tool, _allowed_districts_ctx
 
-    mock_pool = MagicMock()
-    mock_pool.fetch = AsyncMock(return_value=[])
+    tok = _allowed_districts_ctx.set(None)
+    try:
+        mock_pool = MagicMock()
+        mock_pool.fetch = AsyncMock(return_value=[])
 
-    with patch("app.db.get_pool", new=AsyncMock(return_value=mock_pool)):
-        await _run_tool(
-            "query_postgres",
-            {"sql": 'SELECT "DeliveryId" FROM "Deliveries" LIMIT 10'},
-            allowed_districts=None,
-        )
+        with patch("app.db.get_pool", new=AsyncMock(return_value=mock_pool)):
+            await _run_tool(
+                "query_postgres",
+                {"sql": 'SELECT "DeliveryId" FROM "Deliveries" LIMIT 10'},
+            )
 
-    executed_sql = mock_pool.fetch.call_args[0][0]
-    assert "__rbac" not in executed_sql
+        executed_sql = mock_pool.fetch.call_args[0][0]
+        assert "__rbac" not in executed_sql
+    finally:
+        _allowed_districts_ctx.reset(tok)
