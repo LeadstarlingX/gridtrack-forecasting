@@ -11,6 +11,7 @@ Exposes:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -28,6 +29,9 @@ _groq          = AsyncGroq(api_key=settings.groq_api_key)
 _FAST_MODEL    = "llama-3.1-8b-instant"       # urgency notes, short tasks
 _QUALITY_MODEL = "llama-3.3-70b-versatile"    # chatbot, tools, incidents, staffing
 
+
+_allowed_districts_ctx: contextvars.ContextVar[list[str] | None] = \
+    contextvars.ContextVar("_allowed_districts", default=None)
 
 # ── Context compression ──────────────────────────────────────────────────────
 
@@ -283,7 +287,7 @@ async def _run_tool(name: str, args: dict[str, Any], allowed_districts: list[str
         if not sql.upper().startswith("SELECT"):
             return json.dumps({"error": "Only SELECT statements are allowed"})
         sql = _fix_pg_sql(sql)
-        sql = scope_pg_sql(sql, allowed_districts)
+        sql = scope_pg_sql(sql, _allowed_districts_ctx.get())
         from app.db import get_pool
         pool = await get_pool()
         try:
@@ -427,50 +431,58 @@ async def stream_with_tools(prompt: str, allowed_districts: list[str] | None = N
       {"token": "text..."}   — final answer
     """
     # Try each live Gemini model in order before falling back to Groq.
-    for model in _GEMINI_MODELS:
-        if _gemini_dead.get(model):
-            continue
-        got_answer = False
-        try:
-            async for frame in _stream_gemini_with_tools(prompt, model, allowed_districts):
-                yield frame
-                if not got_answer:
-                    try:
-                        got_answer = bool(json.loads(frame).get("token"))
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
-            if got_answer:
-                return
-            logger.warning("Gemini %s returned empty answer, trying next model", model)
-        except Exception as exc:
-            logger.warning("Gemini %s failed (%s), trying next model", model, exc)
-
+    _tok = _allowed_districts_ctx.set(allowed_districts)
     try:
-        async for frame in _stream_groq_with_tools(prompt, allowed_districts):
-            yield frame
-    except Exception as groq_exc:
-        logger.warning("Groq fallback also failed (%s)", groq_exc)
-        yield json.dumps({"token": "Both AI providers are temporarily unavailable. Please try again in a moment."})
+        for model in _GEMINI_MODELS:
+            if _gemini_dead.get(model):
+                continue
+            got_answer = False
+            try:
+                async for frame in _stream_gemini_with_tools(prompt, model):
+                    yield frame
+                    if not got_answer:
+                        try:
+                            got_answer = bool(json.loads(frame).get("token"))
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+                if got_answer:
+                    return
+                logger.warning("Gemini %s returned empty answer, trying next model", model)
+            except Exception as exc:
+                logger.warning("Gemini %s failed (%s), trying next model", model, exc)
+
+        try:
+            async for frame in _stream_groq_with_tools(prompt):
+                yield frame
+        except Exception as groq_exc:
+            logger.warning("Groq fallback also failed (%s)", groq_exc)
+            yield json.dumps({"token": "Both AI providers are temporarily unavailable. Please try again in a moment."})
+    finally:
+        _allowed_districts_ctx.reset(_tok)
 
 
 async def call_llm_with_tools(prompt: str, allowed_districts: list[str] | None = None) -> tuple[str, list[str]]:
     """Tool-calling loop. Gemini chain primary, Groq fallback. Returns (answer, tools_used)."""
-    for model in _GEMINI_MODELS:
-        if _gemini_dead.get(model):
-            continue
-        try:
-            answer, tools_used = await _call_gemini_with_tools(prompt, model, allowed_districts)
-            if answer:
-                return answer, tools_used
-            logger.warning("Gemini %s returned empty answer, trying next model", model)
-        except Exception as exc:
-            logger.warning("Gemini %s failed (%s), trying next model", model, exc)
-
+    _tok = _allowed_districts_ctx.set(allowed_districts)
     try:
-        return await _call_groq_with_tools(prompt, allowed_districts)
-    except Exception as groq_exc:
-        logger.warning("Groq fallback also failed (%s)", groq_exc)
-        return "Both AI providers are temporarily unavailable. Please try again in a moment.", []
+        for model in _GEMINI_MODELS:
+            if _gemini_dead.get(model):
+                continue
+            try:
+                answer, tools_used = await _call_gemini_with_tools(prompt, model)
+                if answer:
+                    return answer, tools_used
+                logger.warning("Gemini %s returned empty answer, trying next model", model)
+            except Exception as exc:
+                logger.warning("Gemini %s failed (%s), trying next model", model, exc)
+
+        try:
+            return await _call_groq_with_tools(prompt)
+        except Exception as groq_exc:
+            logger.warning("Groq fallback also failed (%s)", groq_exc)
+            return "Both AI providers are temporarily unavailable. Please try again in a moment.", []
+    finally:
+        _allowed_districts_ctx.reset(_tok)
 
 
 # ── Private helpers ──────────────────────────────────────────────────────────

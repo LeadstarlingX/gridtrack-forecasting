@@ -4,8 +4,10 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.params import Depends
 from fastapi.responses import StreamingResponse
 
+from app.auth import get_allowed_districts
 from app.messaging import consumer as _consumer
 from app.messaging.consumer import start_consumer
 from app.models import ChatBody, RecommendationRequest, RecommendationResponse, ReportRequest, StaffingRequest, StaffingResponse
@@ -54,37 +56,47 @@ async def ready():
 # ── AI recommendations ───────────────────────────────────────────────────────
 
 @app.post("/recommend", response_model=RecommendationResponse)
-async def recommend(body: RecommendationRequest) -> RecommendationResponse:
+async def recommend(
+    body: RecommendationRequest,
+    _: list[str] | None = Depends(get_allowed_districts),
+) -> RecommendationResponse:
     return await get_recommendation(body)
 
 
 # ── Analytics chatbot ────────────────────────────────────────────────────────
 
 @app.post("/chat")
-async def chat(body: ChatBody):
-    """Non-streaming chat. Uses tool-calling so Groq can query live district state."""
+async def chat(
+    body: ChatBody,
+    districts: list[str] | None = Depends(get_allowed_districts),
+):
     prompt = build_prompt(body.question, body.context)
-    answer, tools_used = await call_llm_with_tools(prompt)
+    answer, tools_used = await call_llm_with_tools(prompt, allowed_districts=districts)
     return {"answer": answer, "tools_used": tools_used}
 
 
 @app.get("/chat/stream")
-async def chat_stream(question: str, context: str = "{}"):
-    """Streaming SSE chat endpoint (GET, query-param form — kept for backward compat)."""
+async def chat_stream(
+    question: str,
+    context: str = "{}",
+    districts: list[str] | None = Depends(get_allowed_districts),
+):
     try:
         ctx = json.loads(context)
     except Exception:
         ctx = {}
-    return _stream_response(question, ctx)
+    return _stream_response(question, ctx, districts)
 
 
 @app.post("/chat/stream")
-async def chat_stream_post(body: ChatBody):
-    """Streaming SSE chat endpoint (POST body — avoids URL-length limits for large CSV)."""
-    return _stream_response(body.question, body.context)
+async def chat_stream_post(
+    body: ChatBody,
+    districts: list[str] | None = Depends(get_allowed_districts),
+):
+    return _stream_response(body.question, body.context, districts)
 
 
-def _stream_response(question: str, ctx: dict, allowed_districts: list[str] | None):
+def _stream_response(question: str, ctx: dict, allowed_districts: list[str] | None = None):
     prompt = build_prompt(question, ctx)
 
     async def event_generator():
@@ -108,11 +120,12 @@ def _stream_response(question: str, ctx: dict, allowed_districts: list[str] | No
 # ── PDF report ───────────────────────────────────────────────────────────────
 
 @app.post("/chat/report")
-async def chat_report(body: ReportRequest):
-    """Generate a 1-page PDF operations report from the conversation (3 LLM calls)."""
+async def chat_report(
+    body: ReportRequest,
+    _: list[str] | None = Depends(get_allowed_districts),
+):
     from app.services.report import generate_report
     from fastapi.responses import Response
-
     pdf_bytes = await generate_report(body.messages, body.context)
     return Response(
         content=pdf_bytes,
@@ -121,10 +134,14 @@ async def chat_report(body: ReportRequest):
     )
 
 
+
 # ── Staffing assistant ───────────────────────────────────────────────────────
 
 @app.post("/staffing", response_model=StaffingResponse)
-async def staffing(body: StaffingRequest) -> StaffingResponse:
+async def staffing(
+    body: StaffingRequest,
+    _: list[str] | None = Depends(get_allowed_districts),
+) -> StaffingResponse:
     return await get_staffing(body)
 
 
@@ -154,13 +171,10 @@ async def transcribe(file: UploadFile = File(...)):
 # ── Delivery trend SARIMA forecast ──────────────────────────────────────────
 
 @app.get("/forecast/delivery-trend")
-async def delivery_trend_forecast(days: int = 3):
-    """SARIMA-based system-wide delivery count forecast, aggregated by day.
-
-    Returns `days` daily predictions as [{bucket, value}] where bucket is an
-    ISO date string (UTC) and value is the predicted total delivery count for
-    that day.
-    """
+async def delivery_trend_forecast(
+    days: int = 3,
+    _: list[str] | None = Depends(get_allowed_districts),
+):
     from app.services.forecast import sarima_forecast_global
     return {"forecast": await sarima_forecast_global(days=min(days, 14))}
 
