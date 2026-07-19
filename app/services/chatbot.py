@@ -103,9 +103,9 @@ EXAMPLE QUERIES (copy the pattern exactly):
 - Delivered today: SELECT COUNT("DeliveryId") FROM "Deliveries" WHERE "Status" = 4 AND "DeliveredAt" >= NOW() - make_interval(hours => 24)
 - Anomalies: SELECT "DeliveryId", "DistrictId", "AnomalyReason" FROM "Deliveries" WHERE "AnomalyFlag" = true LIMIT 20
 - District delivery counts: SELECT "DistrictId", COUNT(*) FROM "Deliveries" WHERE "Status" = 4 GROUP BY "DistrictId" ORDER BY COUNT(*) DESC LIMIT 10
-- Driver with their deliveries: SELECT d."DriverId", d."Name", COUNT(del."DeliveryId") FROM "Drivers" d LEFT JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" GROUP BY d."DriverId", d."Name" LIMIT 20
-- Best drivers today (most deliveries completed on time): SELECT d."Name", COUNT(del."DeliveryId") AS completed FROM "Drivers" d JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" WHERE del."Status" = 4 AND del."DeliveredAt" >= NOW() - make_interval(hours => 24) GROUP BY d."DriverId", d."Name" ORDER BY completed DESC LIMIT 5
-- On-time drivers (delivered before ETA): SELECT d."Name", COUNT(del."DeliveryId") AS on_time FROM "Drivers" d JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" WHERE del."Status" = 4 AND del."DeliveredAt" IS NOT NULL AND del."ExpectedEta" IS NOT NULL AND del."DeliveredAt" <= del."ExpectedEta" GROUP BY d."DriverId", d."Name" ORDER BY on_time DESC LIMIT 5
+- Driver with their deliveries: SELECT d."DriverId", d."Name", d."DistrictId", COUNT(del."DeliveryId") FROM "Drivers" d LEFT JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" GROUP BY d."DriverId", d."Name", d."DistrictId" LIMIT 20
+- Best drivers today (most deliveries completed on time): SELECT d."Name", d."DistrictId", COUNT(del."DeliveryId") AS completed FROM "Drivers" d JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" WHERE del."Status" = 4 AND del."DeliveredAt" >= NOW() - make_interval(hours => 24) GROUP BY d."DriverId", d."Name", d."DistrictId" ORDER BY completed DESC LIMIT 5
+- On-time drivers (delivered before ETA): SELECT d."Name", d."DistrictId", COUNT(del."DeliveryId") AS on_time FROM "Drivers" d JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" WHERE del."Status" = 4 AND del."DeliveredAt" IS NOT NULL AND del."ExpectedEta" IS NOT NULL AND del."DeliveredAt" <= del."ExpectedEta" GROUP BY d."DriverId", d."Name", d."DistrictId" ORDER BY on_time DESC LIMIT 5
 """
 
 _CH_SCHEMA = """

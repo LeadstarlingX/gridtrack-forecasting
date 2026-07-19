@@ -85,11 +85,14 @@ def release_driver(district: str, driver_id: str) -> None:
 
 
 async def sarima_forecast_global(days: int = 3) -> list[dict]:
-    """System-wide SARIMA delivery count forecast aggregated to daily buckets.
+    """System-wide delivery demand forecast aggregated to daily buckets.
 
-    Fits SARIMAX(1,1,1)(1,1,1,24) on the last 14 days of hourly delivery counts
-    and returns `days` daily predicted totals as {bucket, value} dicts.
-    Falls back to a 7-day rolling daily average when history is too sparse.
+    Uses a seasonal-naive baseline (last 7-day daily average) anchored by the
+    week-over-week growth trend, capped at ±8 % per day.  This is intentionally
+    simpler than SARIMA: our seeded training data is too regular (fixed random
+    seed, identical daily distributions) for SARIMAX to produce stable multi-day
+    forecasts — it either goes numerically explosive or decays to zero.  For real
+    operational data with natural variance, swap this back to _fit_and_predict.
     """
     try:
         pool = await get_pool()
@@ -112,35 +115,30 @@ async def sarima_forecast_global(days: int = 3) -> list[dict]:
             last_hr = last_hr.replace(tzinfo=timezone.utc)
         base_day: date = (last_hr + timedelta(hours=1)).date()
 
-        if len(counts) < SARIMA_MIN_POINTS:
-            daily_avg = sum(counts) / max(1, len(counts)) * 24
-            return [
-                {"bucket": (base_day + timedelta(days=i)).isoformat(), "value": round(daily_avg, 1)}
-                for i in range(days)
-            ]
+        # Daily average for the most recent half of the data — the forecast baseline.
+        # Use the second half vs first half so the trend is always computable
+        # regardless of how many hourly buckets are present (some hours drop out of
+        # GROUP BY when they have zero deliveries, so len(counts) < 14*24 is common).
+        half        = max(len(counts) // 2, 1)
+        curr_window = len(counts) - half
+        curr_daily  = sum(counts[half:]) / max(1, curr_window / 24)
+        prev_daily  = sum(counts[:half]) / max(1, half / 24)
 
-        hourly_preds = await asyncio.get_running_loop().run_in_executor(
-            None, _fit_and_predict, counts, days * 24
-        )
-
-        # Anchor the forecast level to the 7-day trailing average so the prediction
-        # line starts where the historical chart ends — preserves SARIMA's trend
-        # direction/shape without inheriting long-run sim-inflated bias.
-        trailing_window = min(7 * 24, len(counts))
-        trailing_daily = sum(counts[-trailing_window:]) / max(1, trailing_window / 24)
-        day0_raw = sum(hourly_preds[:24])
-        scale = trailing_daily / day0_raw if day0_raw > 0 else 1.0
+        # Day-over-day growth rate derived from the two halves; clipped to ±8 %/day.
+        days_in_half = curr_window / 24
+        daily_trend  = (curr_daily - prev_daily) / max(prev_daily, 1) / max(days_in_half, 1)
+        daily_trend  = max(-0.08, min(0.08, daily_trend))
 
         return [
             {
                 "bucket": (base_day + timedelta(days=d)).isoformat(),
-                "value": round(sum(hourly_preds[d * 24 : (d + 1) * 24]) * scale, 1),
+                "value":  round(curr_daily * (1.0 + daily_trend * (d + 1)), 1),
             }
             for d in range(days)
         ]
 
     except Exception as exc:
-        logger.warning("SARIMA global forecast failed: %s", exc)
+        logger.warning("Global delivery trend forecast failed: %s", exc)
         return []
 
 
@@ -199,17 +197,24 @@ async def _refit_district(district: str) -> float:
 
 
 def _fit_and_predict(counts: list[float], steps: int) -> list[float]:
-    """Synchronous SARIMA fit — must be called via run_in_executor."""
+    """Synchronous SARIMA fit — must be called via run_in_executor.
+
+    Uses SARIMA(1,0,1)(1,0,1,24) — no differencing.  Double-differencing
+    (d=1,D=1) drives near-stationary data to near-zero after transformation,
+    causing the scale anchor to amplify predictions to astronomically large
+    values.  With d=0,D=0 the model fits on the raw level directly and
+    forecasts stay in the same magnitude as the training data.
+    """
     from statsmodels.tsa.statespace.sarimax import SARIMAX  # lazy import
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = SARIMAX(
             counts,
-            order=(1, 1, 1),
-            seasonal_order=(1, 1, 1, 24),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
+            order=(2, 0, 0),
+            seasonal_order=(1, 0, 0, 24),
+            enforce_stationarity=True,
+            enforce_invertibility=True,
         )
         fit = model.fit(disp=False, maxiter=50)
     return [max(0.0, float(v)) for v in fit.forecast(steps=steps)]
