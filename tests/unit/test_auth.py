@@ -27,13 +27,27 @@ def test_scope_noop_for_none():
     assert scope_pg_sql(sql, None) == sql
 
 
-def test_scope_wraps_query_for_observer():
+def test_scope_injects_filter_for_non_join_query():
+    """Non-JOIN queries get the district filter injected into WHERE (before LIMIT)."""
     sql = 'SELECT "DeliveryId" FROM "Deliveries" LIMIT 10'
     result = scope_pg_sql(sql, ["mezzeh", "malki"])
-    assert "__rbac" in result
+    assert '"DistrictId" IN' in result
     assert "'mezzeh'" in result
     assert "'malki'" in result
-    assert sql in result          # original preserved as inner query
+    assert "LIMIT 10" in result
+
+
+def test_scope_wraps_join_query_for_observer():
+    """JOIN queries are outer-wrapped so DistrictId from the join is filterable."""
+    sql = (
+        'SELECT d."Name", d."DistrictId", COUNT(del."DeliveryId") '
+        'FROM "Drivers" d JOIN "Deliveries" del ON del."AssignedDriverId" = d."DriverId" '
+        'GROUP BY d."DriverId", d."Name", d."DistrictId"'
+    )
+    result = scope_pg_sql(sql, ["mezzeh"])
+    assert "__rbac" in result
+    assert "'mezzeh'" in result
+    assert sql in result
 
 
 def test_scope_empty_list_returns_no_rows():
@@ -47,16 +61,17 @@ def test_scope_sanitises_injection_attempt():
     assert ";" not in result 
 
 
-def test_scope_handles_complex_query_with_order_by():
-    """Subquery wrap must survive ORDER BY / GROUP BY / LIMIT in the inner SQL."""
+def test_scope_injects_filter_before_group_by():
+    """Non-JOIN with GROUP BY gets the filter injected before GROUP BY, not after."""
     sql = (
         'SELECT "DistrictId", COUNT(*) FROM "Deliveries" '
         'GROUP BY "DistrictId" ORDER BY COUNT(*) DESC LIMIT 10'
     )
     result = scope_pg_sql(sql, ["kafrsousa"])
-    # Outer query wraps inner — both clauses are present
-    assert sql in result
-    assert "__rbac" in result
+    assert '"DistrictId" IN' in result
+    assert "'kafrsousa'" in result
+    assert "GROUP BY" in result
+    assert result.index('"DistrictId" IN') < result.index("GROUP BY")
 
 
 # ── get_allowed_districts ─────────────────────────────────────────────────────
@@ -137,7 +152,7 @@ async def test_run_tool_applies_district_filter_for_observer():
             )
 
         executed_sql = mock_pool.fetch.call_args[0][0]
-        assert "__rbac" in executed_sql
+        assert '"DistrictId" IN' in executed_sql
         assert "'mezzeh'" in executed_sql
     finally:
         _allowed_districts_ctx.reset(tok)
