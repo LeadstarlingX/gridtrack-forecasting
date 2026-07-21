@@ -135,14 +135,14 @@ Auth: `Authorization: Bearer <MCP_API_KEY>` on every request.
 
 ### Connecting from Claude Code
 
-Add to `.claude/settings.json` in your project root:
+Add to `.claude/settings.json` in your project root (or `~/.claude/settings.json` for global):
 
 ```json
 {
   "mcpServers": {
     "gridtrack": {
       "type": "sse",
-      "url": "http://localhost:8000/mcp",
+      "url": "http://localhost:8000/mcp/sse",
       "headers": {
         "Authorization": "Bearer gridtrack-mcp-2026"
       }
@@ -151,21 +151,36 @@ Add to `.claude/settings.json` in your project root:
 }
 ```
 
-Then set `MCP_API_KEY` in your shell and restart Claude Code:
-
-```powershell
-# Windows PowerShell
-$env:MCP_API_KEY = "gridtrack-mcp-2026"
-claude
-```
-
-```bash
-# macOS / Linux
-export MCP_API_KEY="gridtrack-mcp-2026"
-claude
-```
-
 Claude will list the 7 tools above and can call them to read live data directly.
+
+### Connecting from Claude Desktop (Windows)
+
+Claude Desktop does not support SSE servers natively — use `mcp-remote` as a stdio bridge.
+
+**1. Install `mcp-remote` globally (one-time):**
+```bash
+npm install -g mcp-remote
+```
+
+**2. Add to `%APPDATA%\Claude\claude_desktop_config.json`:**
+```json
+{
+  "mcpServers": {
+    "gridtrack": {
+      "command": "mcp-remote.cmd",
+      "args": [
+        "http://localhost:8000/mcp/sse",
+        "--header",
+        "Authorization: Bearer gridtrack-mcp-2026"
+      ]
+    }
+  }
+}
+```
+
+**3.** Make sure the stack is running, then fully restart Claude Desktop.
+
+> **Why `mcp-remote.cmd` and not `npx`?** Claude Desktop launches processes via `cmd.exe`. Paths with spaces (e.g. `C:\Program Files\nodejs\npx`) break the lookup. Installing globally puts `mcp-remote.cmd` in `%APPDATA%\Roaming\npm\` — no spaces, no quoting issues. See the [GridTrack README](https://github.com/LeadstarlingX/GridTrack#mcp-server--ai-agent-integration) for more detail.
 
 ### Connecting from any MCP-compatible agent
 
@@ -176,7 +191,7 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 
 async with sse_client(
-    "http://localhost:8000/mcp",
+    "http://localhost:8000/mcp/sse",
     headers={"Authorization": "Bearer gridtrack-mcp-2026"},
 ) as (read, write):
     async with ClientSession(read, write) as session:
