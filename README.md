@@ -105,6 +105,86 @@ The service logs `Consumer ready — waiting for messages` once the RabbitMQ con
 | `GET`  | `/mcp/sse` | MCP SSE connection (Bearer auth required) |
 | `POST` | `/mcp/messages` | MCP JSON-RPC tool calls (Bearer auth required) |
 
+## MCP server — AI agent integration
+
+gridtrack-forecasting exposes a **Model Context Protocol (MCP) server** so that external AI agents
+(Claude Code, Cursor, custom LLM agents, etc.) can query live fleet data as native tools — no
+REST wrappers needed.
+
+### Transport
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET  http://localhost:8000/mcp/sse` | Open an SSE session — use this as the MCP URL |
+| `POST http://localhost:8000/mcp/messages/?session_id=...` | Send JSON-RPC tool calls |
+
+Auth: `Authorization: Bearer <MCP_API_KEY>` on every request.  
+`MCP_API_KEY` is defined in `.env` at the GridTrack repo root and injected into the container via `compose.yaml`.
+
+### Available tools
+
+| Tool | Parameters | What it returns |
+|------|-----------|-----------------|
+| `get_active_drivers` | `district_id?` | Active drivers (id, name, district, lat/lng) |
+| `get_anomalies` | `district_id?`, `hours=1` | Recent anomalies with type, reason, driver |
+| `get_deliveries_summary` | — | Fleet-wide counts by status |
+| `get_district_status` | `district_id` | Per-district: active drivers, pings, deliveries |
+| `get_stalled_drivers` | `minutes=15` | Drivers with no GPS ping in the last N minutes |
+| `get_activity_trend` | `district_id`, `hours=24` | Hourly delivery counts for trend charts |
+| `get_peak_hours` | `district_id`, `days=7` | Busiest hours over the last N days |
+
+### Connecting from Claude Code
+
+Add to `.claude/settings.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "gridtrack": {
+      "type": "sse",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer gridtrack-mcp-2026"
+      }
+    }
+  }
+}
+```
+
+Then set `MCP_API_KEY` in your shell and restart Claude Code:
+
+```powershell
+# Windows PowerShell
+$env:MCP_API_KEY = "gridtrack-mcp-2026"
+claude
+```
+
+```bash
+# macOS / Linux
+export MCP_API_KEY="gridtrack-mcp-2026"
+claude
+```
+
+Claude will list the 7 tools above and can call them to read live data directly.
+
+### Connecting from any MCP-compatible agent
+
+Any client that supports the MCP SSE transport works. Example with the MCP Python SDK:
+
+```python
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+async with sse_client(
+    "http://localhost:8000/mcp",
+    headers={"Authorization": "Bearer gridtrack-mcp-2026"},
+) as (read, write):
+    async with ClientSession(read, write) as session:
+        await session.initialize()
+        result = await session.call_tool("get_active_drivers", {})
+        print(result.content)
+```
+
 ## Testing
 
 ```bash
@@ -121,7 +201,31 @@ pytest tests/unit/ --cov=app --cov-report=html
 ## Coverage
 
 <!-- COVERAGE_START -->
-*Auto-updated by CI on every push.*
+| Module | Stmts | Miss | Cover |
+|--------|------:|-----:|------:|
+| `app/__init__.py` | 0 | 0 | 100% |
+| `app/auth.py` | 44 | 2 | 95% |
+| `app/ch.py` | 11 | 0 | 100% |
+| `app/config.py` | 13 | 0 | 100% |
+| `app/db.py` | 11 | 0 | 100% |
+| `app/main.py` | 102 | 8 | 92% |
+| `app/mcp_server.py` | 62 | 1 | 98% |
+| `app/messaging/__init__.py` | 0 | 0 | 100% |
+| `app/messaging/consumer.py` | 71 | 0 | 100% |
+| `app/messaging/publisher.py` | 22 | 2 | 91% |
+| `app/models.py` | 84 | 0 | 100% |
+| `app/services/__init__.py` | 0 | 0 | 100% |
+| `app/services/anomaly.py` | 22 | 2 | 91% |
+| `app/services/chatbot.py` | 408 | 15 | 96% |
+| `app/services/completion.py` | 8 | 0 | 100% |
+| `app/services/forecast.py` | 100 | 41 | 59% |
+| `app/services/incident.py` | 47 | 9 | 81% |
+| `app/services/recommendation.py` | 54 | 6 | 89% |
+| `app/services/report.py` | 63 | 0 | 100% |
+| `app/services/staffing.py` | 47 | 5 | 89% |
+| `app/services/surge.py` | 28 | 0 | 100% |
+| `app/services/system_prompt.py` | 4 | 0 | 100% |
+| **TOTAL** | **1201** | **91** | **92%** |
 <!-- COVERAGE_END -->
 
 ## License
