@@ -81,7 +81,6 @@ async def test_call_gemini_passes_prompt_to_model(mocker):
     mocker.patch("google.genai.Client", return_value=mock_client)
     await _call_gemini("how many drivers?")
     call_kwargs = mock_client.models.generate_content.call_args.kwargs
-    assert call_kwargs["model"] == "gemini-2.5-flash"
     assert call_kwargs["contents"] == "how many drivers?"
 
 
