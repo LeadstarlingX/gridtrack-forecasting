@@ -221,7 +221,7 @@ pytest tests/unit/ --cov=app --cov-report=html
 | `app/__init__.py` | 0 | 0 | 100% |
 | `app/auth.py` | 44 | 2 | 95% |
 | `app/ch.py` | 11 | 0 | 100% |
-| `app/config.py` | 15 | 0 | 100% |
+| `app/config.py` | 13 | 0 | 100% |
 | `app/db.py` | 11 | 0 | 100% |
 | `app/main.py` | 102 | 8 | 92% |
 | `app/mcp_server.py` | 62 | 1 | 98% |
@@ -231,7 +231,7 @@ pytest tests/unit/ --cov=app --cov-report=html
 | `app/models.py` | 84 | 0 | 100% |
 | `app/services/__init__.py` | 0 | 0 | 100% |
 | `app/services/anomaly.py` | 22 | 2 | 91% |
-| `app/services/chatbot.py` | 582 | 154 | 74% |
+| `app/services/chatbot.py` | 408 | 15 | 96% |
 | `app/services/completion.py` | 8 | 0 | 100% |
 | `app/services/forecast.py` | 100 | 41 | 59% |
 | `app/services/incident.py` | 47 | 9 | 81% |
@@ -240,7 +240,7 @@ pytest tests/unit/ --cov=app --cov-report=html
 | `app/services/staffing.py` | 47 | 5 | 89% |
 | `app/services/surge.py` | 28 | 0 | 100% |
 | `app/services/system_prompt.py` | 4 | 0 | 100% |
-| **TOTAL** | **1377** | **230** | **83%** |
+| **TOTAL** | **1201** | **91** | **92%** |
 <!-- COVERAGE_END -->
 
 ## License
