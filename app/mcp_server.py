@@ -8,7 +8,7 @@ Transport: Streamable HTTP (SSE).
 import json
 from datetime import timedelta
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer as FastMCP
 
 from app.db import get_pool
 from app.ch import ch_query

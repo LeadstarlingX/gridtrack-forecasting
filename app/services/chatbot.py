@@ -1,7 +1,7 @@
 """LLM chat service.
 
-Primary: Groq llama-3.3-70b-versatile.
-Fallback: Gemini Flash (if Groq fails).
+Primary: OpenRouter (Llama 3.3 70B, global, free tier).
+Fallback chain: Groq llama-3.3-70b-versatile → Gemini Flash.
 
 Exposes:
   call_llm(prompt)              — non-streaming, returns full string
@@ -18,7 +18,9 @@ from collections.abc import AsyncGenerator
 from datetime import timedelta
 from typing import Any
 
+from anthropic import AsyncAnthropic
 from groq import AsyncGroq
+from openai import AsyncOpenAI
 
 from app.auth import scope_pg_sql
 from app.config import settings
@@ -28,6 +30,38 @@ logger = logging.getLogger(__name__)
 _groq          = AsyncGroq(api_key=settings.groq_api_key)
 _FAST_MODEL    = "llama-3.1-8b-instant"       # urgency notes, short tasks
 _QUALITY_MODEL = "llama-3.3-70b-versatile"    # chatbot, tools, incidents, staffing
+
+_CLAUDE_MODEL      = "claude-opus-5"
+_CLAUDE_FAST_MODEL = "claude-haiku-4-5"
+
+# Ordered by quality — all confirmed to support tool_choice on OpenRouter free tier.
+# First model that doesn't 429/error wins; daily limits are per-model so cycling extends capacity.
+_OR_MODELS = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "poolside/laguna-s-2.1:free",
+    "inclusionai/ling-3.0-flash:free",
+    "poolside/laguna-xs-2.1:free",
+]
+
+_anthropic: AsyncAnthropic | None = None
+_openrouter: AsyncOpenAI | None = None
+
+
+def _get_anthropic() -> AsyncAnthropic:
+    global _anthropic
+    if _anthropic is None:
+        _anthropic = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    return _anthropic
+
+
+def _get_openrouter() -> AsyncOpenAI:
+    global _openrouter
+    if _openrouter is None:
+        _openrouter = AsyncOpenAI(
+            api_key=settings.openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+    return _openrouter
 
 
 _allowed_districts_ctx: contextvars.ContextVar[list[str] | None] = \
@@ -223,20 +257,69 @@ _GEMINI_SYSTEM = (
 # Ordered Gemini models to try — primary first, fallback chain after.
 # Verify API IDs against Google AI Studio if names change.
 _GEMINI_MODELS = [
-    "gemini-2.5-flash",       # Gemini 2.5 Flash  (best quality, 20 RPD free)
     "gemini-2.0-flash",       # Gemini 2.0 Flash  (current workhorse)
     "gemini-2.0-flash-lite",  # Gemini Flash Lite (high RPD, lighter model)
 ]
 
-# Lazy-cached Gemini tool list (avoids importing google.genai at startup)
+# Lazy-cached tool lists (avoids importing google.genai at startup)
 _gemini_tools_cache: list | None = None
-# Per-model circuit-breakers: True when a model's daily quota is exhausted.
-_gemini_dead: dict[str, bool] = {}
+_claude_tools_cache: list | None = None
+
+
+def _get_claude_tools() -> list:
+    global _claude_tools_cache
+    if _claude_tools_cache is None:
+        _claude_tools_cache = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"]["description"],
+                "input_schema": t["function"]["parameters"],
+            }
+            for t in _TOOLS
+        ]
+    return _claude_tools_cache
+# Per-model circuit-breakers: timestamp when the model was marked dead, or None.
+# Quota errors (PerDay) reset after 6 h. Key/permission errors reset after 1 h
+# (a restart or key rotation fixes those; the timer just avoids an infinite dead state).
+import time as _time
+_gemini_dead: dict[str, float] = {}   # model → epoch seconds when tripped
+_GEMINI_DEAD_TTL = 6 * 3600            # 6 hours
+
+# OpenRouter account-level daily limit tracker.
+# All free models share one quota; hitting any 429 "free-models-per-day" means
+# the entire account is exhausted — skip remaining models immediately.
+_or_state: dict = {"exhausted_until": 0.0}
+
+
+def _is_or_exhausted() -> bool:
+    return _time.time() < _or_state["exhausted_until"]
+
+
+def _trip_or_limit() -> None:
+    _or_state["exhausted_until"] = _time.time() + 3600
+    logger.warning("OpenRouter daily limit hit — skipping OR for 1 h")
+
+
+def _or_daily_limit_hit(exc: Exception) -> bool:
+    """True when the error is an account-wide daily cap (not a per-model error)."""
+    s = str(exc)
+    return "429" in s and "free-models-per-day" in s
+
+
+def _is_gemini_dead(model: str) -> bool:
+    tripped_at = _gemini_dead.get(model)
+    if tripped_at is None:
+        return False
+    if _time.time() - tripped_at > _GEMINI_DEAD_TTL:
+        del _gemini_dead[model]
+        logger.info("Gemini %s circuit breaker reset after TTL — will retry", model)
+        return False
+    return True
 
 
 def _next_gemini_model() -> str | None:
-    """Return the first Gemini model that hasn't hit its daily quota, or None."""
-    return next((m for m in _GEMINI_MODELS if not _gemini_dead.get(m)), None)
+    """Return the first Gemini model that hasn't hit its quota/error TTL, or None."""
+    return next((m for m in _GEMINI_MODELS if not _is_gemini_dead(m)), None)
 
 
 def _get_gemini_tools() -> list:
@@ -323,23 +406,60 @@ async def _run_tool(name: str, args: dict[str, Any], allowed_districts: list[str
 # ── Public API ───────────────────────────────────────────────────────────────
 
 async def call_llm(prompt: str) -> str:
-    """Non-streaming call. Groq primary, Gemini multi-model fallback."""
+    """Non-streaming call. OpenRouter primary, Groq secondary, Gemini multi-model fallback."""
+    if settings.openrouter_api_key and not _is_or_exhausted():
+        for or_model in _OR_MODELS:
+            try:
+                resp = await _get_openrouter().chat.completions.create(
+                    model=or_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=400,
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                if content:
+                    return content
+                logger.warning("OpenRouter %s empty content, trying next", or_model)
+            except Exception as exc:
+                if _or_daily_limit_hit(exc):
+                    _trip_or_limit()
+                    break
+                logger.warning("OpenRouter %s failed (%s), trying next", or_model, exc)
     try:
         return await _call_groq(prompt)
     except Exception as exc:
         logger.warning("Groq failed (%s), trying Gemini models", exc)
     for model in _GEMINI_MODELS:
-        if _gemini_dead.get(model):
+        if _is_gemini_dead(model):
             continue
         try:
             return await _call_gemini(prompt, model)
         except Exception as exc:
             logger.warning("Gemini %s failed (%s), trying next model", model, exc)
+    dead = [m for m in _GEMINI_MODELS if _is_gemini_dead(m)]
+    if dead:
+        logger.warning("All Gemini models circuit-broken (%s) — no LLM available", dead)
     raise RuntimeError("All LLM providers failed")
 
 
 async def call_llm_fast(prompt: str) -> str:
     """Fast / cheap model for short structured outputs (urgency notes etc.)."""
+    if settings.openrouter_api_key and not _is_or_exhausted():
+        for or_model in _OR_MODELS:
+            try:
+                resp = await _get_openrouter().chat.completions.create(
+                    model=or_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=60,
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                if content:
+                    return content
+                logger.warning("OpenRouter fast %s empty content, trying next", or_model)
+            except Exception as exc:
+                if _or_daily_limit_hit(exc):
+                    _trip_or_limit()
+                    break
+                logger.warning("OpenRouter fast %s failed (%s), trying next", or_model, exc)
     try:
         resp = await _groq.chat.completions.create(
             model=_FAST_MODEL,
@@ -348,12 +468,31 @@ async def call_llm_fast(prompt: str) -> str:
         )
         return resp.choices[0].message.content.strip()
     except Exception as exc:
-        logger.warning("Fast Groq failed (%s), falling back to call_llm chain", exc)
-        return await call_llm(prompt)
+        logger.warning("Groq fast failed (%s), falling back to call_llm chain", exc)
+    return await call_llm(prompt)
 
 
 async def stream_llm(prompt: str) -> AsyncGenerator[str, None]:
-    """Streaming generator — yields token strings. Falls back to single chunk on error."""
+    """Streaming generator — yields token strings. OpenRouter primary, Groq/Gemini fallback."""
+    if settings.openrouter_api_key and not _is_or_exhausted():
+        for or_model in _OR_MODELS:
+            try:
+                stream = await _get_openrouter().chat.completions.create(
+                    model=or_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True,
+                    max_tokens=400,
+                )
+                async for chunk in stream:
+                    token = chunk.choices[0].delta.content
+                    if token:
+                        yield token
+                return
+            except Exception as exc:
+                if _or_daily_limit_hit(exc):
+                    _trip_or_limit()
+                    break
+                logger.warning("OpenRouter %s streaming failed (%s), trying next", or_model, exc)
     try:
         stream = await _groq.chat.completions.create(
             model=_QUALITY_MODEL,
@@ -366,7 +505,7 @@ async def stream_llm(prompt: str) -> AsyncGenerator[str, None]:
             if token:
                 yield token
     except Exception as exc:
-        logger.warning("Groq streaming failed (%s), falling back", exc)
+        logger.warning("Groq streaming failed (%s), falling back to Gemini", exc)
         result = await _call_gemini(prompt)
         yield result
 
@@ -424,15 +563,39 @@ def _recover_tool_calls(exc: Exception) -> list[tuple[str, dict]] | None:
 
 
 async def stream_with_tools(prompt: str, allowed_districts: list[str] | None = None) -> AsyncGenerator[str, None]:
-    """Streaming with tool calling. Gemini chain primary, Groq fallback.
+    """Streaming with tool calling. Claude primary, Gemini chain secondary, Groq fallback.
 
     Yields JSON-encoded frames:
       {"tool": "name"}       — emitted when a tool is called
       {"token": "text..."}   — final answer
     """
-    # Try each live Gemini model in order before falling back to Groq.
     _tok = _allowed_districts_ctx.set(allowed_districts)
     try:
+        # OpenRouter primary — cycle through free models until one answers
+        if settings.openrouter_api_key and not _is_or_exhausted():
+            for or_model in _OR_MODELS:
+                got_answer = False
+                try:
+                    async for frame in _stream_groq_with_tools(
+                        prompt, client=_get_openrouter(), model=or_model
+                    ):
+                        yield frame
+                        if not got_answer:
+                            try:
+                                got_answer = bool(json.loads(frame).get("token"))
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+                    if got_answer:
+                        return
+                    logger.warning("OpenRouter %s empty answer, trying next", or_model)
+                except Exception as exc:
+                    if _or_daily_limit_hit(exc):
+                        _or_exhausted_until = _time.time() + 3600
+                        logger.warning("OpenRouter daily limit hit — skipping OR for 1 h")
+                        break
+                    logger.warning("OpenRouter %s stream failed (%s), trying next", or_model, exc)
+
+        # Gemini fallback
         for model in _GEMINI_MODELS:
             if _gemini_dead.get(model):
                 continue
@@ -462,9 +625,27 @@ async def stream_with_tools(prompt: str, allowed_districts: list[str] | None = N
 
 
 async def call_llm_with_tools(prompt: str, allowed_districts: list[str] | None = None) -> tuple[str, list[str]]:
-    """Tool-calling loop. Gemini chain primary, Groq fallback. Returns (answer, tools_used)."""
+    """Tool-calling loop. Claude primary, Gemini chain secondary, Groq fallback. Returns (answer, tools_used)."""
     _tok = _allowed_districts_ctx.set(allowed_districts)
     try:
+        # OpenRouter primary — cycle through free models until one answers
+        if settings.openrouter_api_key and not _is_or_exhausted():
+            for or_model in _OR_MODELS:
+                try:
+                    answer, tools_used = await _call_groq_with_tools(
+                        prompt, client=_get_openrouter(), model=or_model
+                    )
+                    if answer:
+                        return answer, tools_used
+                    logger.warning("OpenRouter %s empty answer, trying next", or_model)
+                except Exception as exc:
+                    if _or_daily_limit_hit(exc):
+                        _or_exhausted_until = _time.time() + 3600
+                        logger.warning("OpenRouter daily limit hit — skipping OR for 1 h")
+                        break
+                    logger.warning("OpenRouter %s failed (%s), trying next", or_model, exc)
+
+        # Gemini fallback
         for model in _GEMINI_MODELS:
             if _gemini_dead.get(model):
                 continue
@@ -511,14 +692,16 @@ async def _call_gemini(prompt: str, model: str | None = None) -> str:
     return _gemini_resp_text(resp)
 
 
-async def _stream_groq_with_tools(prompt: str, allowed_districts: list[str] | None = None) -> AsyncGenerator[str, None]:
-    """Groq tool-calling streaming loop (fallback)."""
+async def _stream_groq_with_tools(prompt: str, allowed_districts: list[str] | None = None, *, client=None, model: str | None = None) -> AsyncGenerator[str, None]:
+    """OpenAI-compatible tool-calling streaming loop. Defaults to Groq."""
+    client = client or _groq
+    model  = model  or _QUALITY_MODEL
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     msg = None
     for _ in range(3):
         try:
-            resp = await _groq.chat.completions.create(
-                model=_QUALITY_MODEL, messages=messages, tools=_TOOLS,
+            resp = await client.chat.completions.create(
+                model=model, messages=messages, tools=_TOOLS,
                 tool_choice="auto", max_tokens=800,
             )
         except Exception as call_exc:
@@ -558,8 +741,8 @@ async def _stream_groq_with_tools(prompt: str, allowed_districts: list[str] | No
     # Loop exhausted with tool context — force a final answer
     if msg and msg.tool_calls:
         try:
-            final = await _groq.chat.completions.create(
-                model=_QUALITY_MODEL, messages=messages, tool_choice="none", max_tokens=400,
+            final = await client.chat.completions.create(
+                model=model, messages=messages, tool_choice="none", max_tokens=400,
             )
             yield json.dumps({"token": (final.choices[0].message.content or "").strip()})
             return
@@ -568,22 +751,24 @@ async def _stream_groq_with_tools(prompt: str, allowed_districts: list[str] | No
     yield json.dumps({"token": (msg.content or "").strip() if msg else ""})
 
 
-async def _call_groq_with_tools(prompt: str, allowed_districts: list[str] | None = None) -> tuple[str, list[str]]:
-    """Groq tool-calling loop (fallback). Returns (answer, tools_used)."""
+async def _call_groq_with_tools(prompt: str, allowed_districts: list[str] | None = None, *, client=None, model: str | None = None) -> tuple[str, list[str]]:
+    """OpenAI-compatible tool-calling loop. Defaults to Groq. Returns (answer, tools_used)."""
+    client = client or _groq
+    model  = model  or _QUALITY_MODEL
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     tools_used: list[str] = []
     msg = None
     for _ in range(3):
         try:
-            resp = await _groq.chat.completions.create(
-                model=_QUALITY_MODEL, messages=messages, tools=_TOOLS,
+            resp = await client.chat.completions.create(
+                model=model, messages=messages, tools=_TOOLS,
                 tool_choice="auto", max_tokens=800,
             )
         except Exception as call_exc:
             recovered = _recover_tool_calls(call_exc)
             if not recovered:
                 raise
-            logger.warning("Recovered %d tool call(s) from malformed Groq JSON", len(recovered))
+            logger.warning("Recovered %d tool call(s) from malformed JSON", len(recovered))
             fake_payload = [
                 {"id": f"r{i}", "type": "function",
                  "function": {"name": n, "arguments": json.dumps(a)}}
@@ -615,8 +800,8 @@ async def _call_groq_with_tools(prompt: str, allowed_districts: list[str] | None
     # Loop exhausted with tool context — force a final answer
     if msg and msg.tool_calls:
         try:
-            final = await _groq.chat.completions.create(
-                model=_QUALITY_MODEL, messages=messages, tool_choice="none", max_tokens=400,
+            final = await client.chat.completions.create(
+                model=model, messages=messages, tool_choice="none", max_tokens=400,
             )
             return (final.choices[0].message.content or "").strip(), tools_used
         except Exception:
@@ -647,10 +832,14 @@ async def _gemini_generate(client, model: str, contents, config):
                 "PerDay" in exc_str
                 or ("free_tier_requests" in exc_str and "limit: 0" in exc_str)
                 or ("403" in exc_str and "PERMISSION_DENIED" in exc_str)
+                or "API_KEY_INVALID" in exc_str
                 or "leaked" in exc_str.lower()
             ):
-                _gemini_dead[model] = True
-                logger.warning("Gemini %s permanently unavailable (%s) — circuit breaker tripped", model, exc_str[:120])
+                _gemini_dead[model] = _time.time()
+                logger.warning(
+                    "Gemini %s circuit breaker tripped — will retry in %.0f h (%s)",
+                    model, _GEMINI_DEAD_TTL / 3600, exc_str[:120],
+                )
                 raise
             if attempt == 0:
                 if "503" in exc_str:
@@ -733,6 +922,94 @@ async def _stream_gemini_with_tools(prompt: str, model: str, allowed_districts: 
     try:
         resp = await _gemini_generate(client, model, contents, config)
         yield json.dumps({"token": _gemini_resp_text(resp)})
+    except Exception:
+        yield json.dumps({"token": ""})
+
+
+async def _call_claude(prompt: str) -> str:
+    if not settings.anthropic_api_key:
+        raise RuntimeError("Claude unavailable: ANTHROPIC_API_KEY not set")
+    resp = await _get_anthropic().messages.create(
+        model=_CLAUDE_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=400,
+    )
+    return "".join(b.text for b in resp.content if b.type == "text")
+
+
+async def _call_claude_with_tools(prompt: str) -> tuple[str, list[str]]:
+    if not settings.anthropic_api_key:
+        raise RuntimeError("Claude unavailable: ANTHROPIC_API_KEY not set")
+    client = _get_anthropic()
+    messages: list[dict[str, Any]] = [{"role": "user", "content": _user_content(prompt)}]
+    tools_used: list[str] = []
+
+    for _ in range(3):
+        resp = await client.messages.create(
+            model=_CLAUDE_MODEL,
+            system=_GEMINI_SYSTEM,
+            tools=_get_claude_tools(),
+            messages=messages,
+            max_tokens=1024,
+        )
+        tool_blocks = [b for b in resp.content if b.type == "tool_use"]
+        if not tool_blocks:
+            return "".join(b.text for b in resp.content if b.type == "text"), tools_used
+
+        messages.append({"role": "assistant", "content": resp.content})
+        tool_results = []
+        for b in tool_blocks:
+            tools_used.append(b.name)
+            result = await _run_tool(b.name, dict(b.input))
+            tool_results.append({"type": "tool_result", "tool_use_id": b.id, "content": result})
+        messages.append({"role": "user", "content": tool_results})
+
+    # Loop exhausted — force final answer
+    messages.append({"role": "user", "content": "Based on the data collected, give a direct answer now. Do not call any more tools."})
+    try:
+        final = await client.messages.create(
+            model=_CLAUDE_MODEL, system=_GEMINI_SYSTEM, messages=messages, max_tokens=400,
+        )
+        return "".join(b.text for b in final.content if b.type == "text"), tools_used
+    except Exception:
+        return "", tools_used
+
+
+async def _stream_claude_with_tools(prompt: str) -> AsyncGenerator[str, None]:
+    if not settings.anthropic_api_key:
+        yield json.dumps({"token": "Claude unavailable: ANTHROPIC_API_KEY not set."})
+        return
+    client = _get_anthropic()
+    messages: list[dict[str, Any]] = [{"role": "user", "content": _user_content(prompt)}]
+
+    for _ in range(3):
+        resp = await client.messages.create(
+            model=_CLAUDE_MODEL,
+            system=_GEMINI_SYSTEM,
+            tools=_get_claude_tools(),
+            messages=messages,
+            max_tokens=1024,
+        )
+        tool_blocks = [b for b in resp.content if b.type == "tool_use"]
+        if not tool_blocks:
+            yield json.dumps({"token": "".join(b.text for b in resp.content if b.type == "text")})
+            return
+
+        messages.append({"role": "assistant", "content": resp.content})
+        tool_results = []
+        for b in tool_blocks:
+            yield json.dumps({"tool": b.name})
+            result = await _run_tool(b.name, dict(b.input))
+            tool_results.append({"type": "tool_result", "tool_use_id": b.id, "content": result})
+        messages.append({"role": "user", "content": tool_results})
+
+    # Loop exhausted — force final answer
+    messages.append({"role": "user", "content": "Based on the data collected, give a direct answer now. Do not call any more tools."})
+    try:
+        final = await client.messages.create(
+            model=_CLAUDE_MODEL, system=_GEMINI_SYSTEM, messages=messages, max_tokens=400,
+        )
+        yield json.dumps({"token": "".join(b.text for b in final.content if b.type == "text")})
     except Exception:
         yield json.dumps({"token": ""})
 
