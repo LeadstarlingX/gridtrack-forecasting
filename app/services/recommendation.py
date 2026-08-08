@@ -11,35 +11,16 @@ logger = logging.getLogger(__name__)
 
 _VALID_ACTIONS = frozenset({"Reassign", "Contact", "Cancel", "Monitor"})
 
-_SYSTEM_PROMPT = """\
-You are a delivery operations assistant for a Damascus courier service.
-Respond ONLY with valid JSON — no explanation, no markdown, no extra text.
-Required schema:
-{
-  "recommended_action": "Reassign" | "Contact" | "Cancel" | "Monitor",
-  "candidate_rank": 1 | 2 | 3 | null,
-  "reason": "<one concise sentence>",
-  "urgency_score": <integer 1-10>
-}
-Rules:
-- candidate_rank must be null when recommended_action is Contact, Cancel, or Monitor.
-- candidate_rank is 1, 2, or 3 when recommended_action is Reassign.
-- urgency_score reflects how urgent the situation is (10 = critical).
-"""
-
-
 def _build_prompt(req: RecommendationRequest) -> str:
-    lines = [
-        _SYSTEM_PROMPT,
-        f"\nDelivery {req.delivery_id} in district '{req.district_id}'.",
-    ]
+    lines = [f"Delivery {req.delivery_id}, district '{req.district_id}'."]
+
     if req.anomaly_type:
-        lines.append(f"Anomaly detected: {req.anomaly_type}. Reason: {req.anomaly_reason or 'unknown'}.")
+        lines.append(f"Anomaly: {req.anomaly_type}. {req.anomaly_reason or 'unknown'}.")
     else:
-        lines.append("No anomaly — proactive assignment recommendation requested.")
+        lines.append("No anomaly — proactive assignment recommendation.")
 
     if req.candidates:
-        lines.append("\nAvailable drivers (ranked by composite score):")
+        lines.append("Available drivers (ranked by composite score):")
         for c in req.candidates:
             rate = f"{c.on_time_rate_pct:.0%}" if c.on_time_rate_pct is not None else "no history"
             lines.append(
@@ -47,9 +28,15 @@ def _build_prompt(req: RecommendationRequest) -> str:
                 f"on-time rate {rate}, score {c.score:.3f}"
             )
     else:
-        lines.append("\nNo available drivers nearby.")
+        lines.append("No available drivers nearby.")
 
-    lines.append("\nProvide your recommendation as JSON:")
+    lines.append(
+        '\nOutput a single JSON object — no other text:\n'
+        '{"recommended_action":"Reassign"|"Contact"|"Cancel"|"Monitor",'
+        '"candidate_rank":1|2|3|null,"reason":"one sentence","urgency_score":1-10}\n'
+        'candidate_rank is 1-3 only when Reassign, else null.\n'
+        'Output:'
+    )
     return "\n".join(lines)
 
 
@@ -97,7 +84,7 @@ def _safe_default() -> RecommendationResponse:
 async def get_recommendation(req: RecommendationRequest) -> RecommendationResponse:
     prompt = _build_prompt(req)
     try:
-        raw = await call_llm(prompt)
+        raw = await call_llm(prompt, response_format={"type": "json_object"})
         return _parse_response(raw)
     except Exception as exc:
         logger.warning("Recommendation LLM call failed: %s", exc)

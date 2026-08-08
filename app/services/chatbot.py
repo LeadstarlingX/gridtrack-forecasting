@@ -44,7 +44,10 @@ _OR_MODELS = [
 ]
 
 _anthropic: AsyncAnthropic | None = None
-_openrouter: AsyncOpenAI | None = None
+
+# Per-account OR pool: list of [AsyncOpenAI client, exhausted_until_epoch].
+# Built lazily from the three optional key slots; empty slots are skipped.
+_or_pool: list = []
 
 
 def _get_anthropic() -> AsyncAnthropic:
@@ -54,14 +57,19 @@ def _get_anthropic() -> AsyncAnthropic:
     return _anthropic
 
 
-def _get_openrouter() -> AsyncOpenAI:
-    global _openrouter
-    if _openrouter is None:
-        _openrouter = AsyncOpenAI(
-            api_key=settings.openrouter_api_key,
-            base_url="https://openrouter.ai/api/v1",
-        )
-    return _openrouter
+def _or_pool_init() -> None:
+    global _or_pool
+    if _or_pool:
+        return
+    keys = [k for k in [
+        settings.openrouter_api_key,
+        settings.openrouter_api_key_2,
+        settings.openrouter_api_key_3,
+    ] if k]
+    _or_pool = [
+        [AsyncOpenAI(api_key=k, base_url="https://openrouter.ai/api/v1"), 0.0]
+        for k in keys
+    ]
 
 
 _allowed_districts_ctx: contextvars.ContextVar[list[str] | None] = \
@@ -285,21 +293,6 @@ import time as _time
 _gemini_dead: dict[str, float] = {}   # model → epoch seconds when tripped
 _GEMINI_DEAD_TTL = 6 * 3600            # 6 hours
 
-# OpenRouter account-level daily limit tracker.
-# All free models share one quota; hitting any 429 "free-models-per-day" means
-# the entire account is exhausted — skip remaining models immediately.
-_or_state: dict = {"exhausted_until": 0.0}
-
-
-def _is_or_exhausted() -> bool:
-    return _time.time() < _or_state["exhausted_until"]
-
-
-def _trip_or_limit() -> None:
-    _or_state["exhausted_until"] = _time.time() + 3600
-    logger.warning("OpenRouter daily limit hit — skipping OR for 1 h")
-
-
 def _or_daily_limit_hit(exc: Exception) -> bool:
     """True when the error is an account-wide daily cap (not a per-model error)."""
     s = str(exc)
@@ -405,15 +398,20 @@ async def _run_tool(name: str, args: dict[str, Any], allowed_districts: list[str
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-async def call_llm(prompt: str) -> str:
+async def call_llm(prompt: str, *, response_format: dict | None = None) -> str:
     """Non-streaming call. OpenRouter primary, Groq secondary, Gemini multi-model fallback."""
-    if settings.openrouter_api_key and not _is_or_exhausted():
+    _or_pool_init()
+    for _or_entry in _or_pool:
+        if _time.time() < _or_entry[1]:
+            continue
+        _or_daily_hit = False
         for or_model in _OR_MODELS:
             try:
-                resp = await _get_openrouter().chat.completions.create(
+                resp = await _or_entry[0].chat.completions.create(
                     model=or_model,
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=400,
+                    **({"response_format": response_format} if response_format else {}),
                 )
                 content = (resp.choices[0].message.content or "").strip()
                 if content:
@@ -421,11 +419,15 @@ async def call_llm(prompt: str) -> str:
                 logger.warning("OpenRouter %s empty content, trying next", or_model)
             except Exception as exc:
                 if _or_daily_limit_hit(exc):
-                    _trip_or_limit()
+                    _or_entry[1] = _time.time() + 3600
+                    logger.warning("OpenRouter account daily limit hit — trying next account")
+                    _or_daily_hit = True
                     break
                 logger.warning("OpenRouter %s failed (%s), trying next", or_model, exc)
+        if not _or_daily_hit:
+            break
     try:
-        return await _call_groq(prompt)
+        return await _call_groq(prompt, response_format=response_format)
     except Exception as exc:
         logger.warning("Groq failed (%s), trying Gemini models", exc)
     for model in _GEMINI_MODELS:
@@ -443,10 +445,14 @@ async def call_llm(prompt: str) -> str:
 
 async def call_llm_fast(prompt: str) -> str:
     """Fast / cheap model for short structured outputs (urgency notes etc.)."""
-    if settings.openrouter_api_key and not _is_or_exhausted():
+    _or_pool_init()
+    for _or_entry in _or_pool:
+        if _time.time() < _or_entry[1]:
+            continue
+        _or_daily_hit = False
         for or_model in _OR_MODELS:
             try:
-                resp = await _get_openrouter().chat.completions.create(
+                resp = await _or_entry[0].chat.completions.create(
                     model=or_model,
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=60,
@@ -457,9 +463,13 @@ async def call_llm_fast(prompt: str) -> str:
                 logger.warning("OpenRouter fast %s empty content, trying next", or_model)
             except Exception as exc:
                 if _or_daily_limit_hit(exc):
-                    _trip_or_limit()
+                    _or_entry[1] = _time.time() + 3600
+                    logger.warning("OpenRouter account daily limit hit — trying next account")
+                    _or_daily_hit = True
                     break
                 logger.warning("OpenRouter fast %s failed (%s), trying next", or_model, exc)
+        if not _or_daily_hit:
+            break
     try:
         resp = await _groq.chat.completions.create(
             model=_FAST_MODEL,
@@ -474,10 +484,14 @@ async def call_llm_fast(prompt: str) -> str:
 
 async def stream_llm(prompt: str) -> AsyncGenerator[str, None]:
     """Streaming generator — yields token strings. OpenRouter primary, Groq/Gemini fallback."""
-    if settings.openrouter_api_key and not _is_or_exhausted():
+    _or_pool_init()
+    for _or_entry in _or_pool:
+        if _time.time() < _or_entry[1]:
+            continue
+        _or_daily_hit = False
         for or_model in _OR_MODELS:
             try:
-                stream = await _get_openrouter().chat.completions.create(
+                stream = await _or_entry[0].chat.completions.create(
                     model=or_model,
                     messages=[{"role": "user", "content": prompt}],
                     stream=True,
@@ -490,9 +504,13 @@ async def stream_llm(prompt: str) -> AsyncGenerator[str, None]:
                 return
             except Exception as exc:
                 if _or_daily_limit_hit(exc):
-                    _trip_or_limit()
+                    _or_entry[1] = _time.time() + 3600
+                    logger.warning("OpenRouter account daily limit hit — trying next account")
+                    _or_daily_hit = True
                     break
                 logger.warning("OpenRouter %s streaming failed (%s), trying next", or_model, exc)
+        if not _or_daily_hit:
+            break
     try:
         stream = await _groq.chat.completions.create(
             model=_QUALITY_MODEL,
@@ -571,13 +589,17 @@ async def stream_with_tools(prompt: str, allowed_districts: list[str] | None = N
     """
     _tok = _allowed_districts_ctx.set(allowed_districts)
     try:
-        # OpenRouter primary — cycle through free models until one answers
-        if settings.openrouter_api_key and not _is_or_exhausted():
+        # OpenRouter primary — cycle through accounts, then models within each
+        _or_pool_init()
+        for _or_entry in _or_pool:
+            if _time.time() < _or_entry[1]:
+                continue
+            _or_daily_hit = False
             for or_model in _OR_MODELS:
                 got_answer = False
                 try:
                     async for frame in _stream_groq_with_tools(
-                        prompt, client=_get_openrouter(), model=or_model
+                        prompt, client=_or_entry[0], model=or_model
                     ):
                         yield frame
                         if not got_answer:
@@ -590,10 +612,13 @@ async def stream_with_tools(prompt: str, allowed_districts: list[str] | None = N
                     logger.warning("OpenRouter %s empty answer, trying next", or_model)
                 except Exception as exc:
                     if _or_daily_limit_hit(exc):
-                        _or_exhausted_until = _time.time() + 3600
-                        logger.warning("OpenRouter daily limit hit — skipping OR for 1 h")
+                        _or_entry[1] = _time.time() + 3600
+                        logger.warning("OpenRouter account daily limit hit — trying next account")
+                        _or_daily_hit = True
                         break
                     logger.warning("OpenRouter %s stream failed (%s), trying next", or_model, exc)
+            if not _or_daily_hit:
+                break
 
         # Gemini fallback
         for model in _GEMINI_MODELS:
@@ -628,22 +653,29 @@ async def call_llm_with_tools(prompt: str, allowed_districts: list[str] | None =
     """Tool-calling loop. Claude primary, Gemini chain secondary, Groq fallback. Returns (answer, tools_used)."""
     _tok = _allowed_districts_ctx.set(allowed_districts)
     try:
-        # OpenRouter primary — cycle through free models until one answers
-        if settings.openrouter_api_key and not _is_or_exhausted():
+        # OpenRouter primary — cycle through accounts, then models within each
+        _or_pool_init()
+        for _or_entry in _or_pool:
+            if _time.time() < _or_entry[1]:
+                continue
+            _or_daily_hit = False
             for or_model in _OR_MODELS:
                 try:
                     answer, tools_used = await _call_groq_with_tools(
-                        prompt, client=_get_openrouter(), model=or_model
+                        prompt, client=_or_entry[0], model=or_model
                     )
                     if answer:
                         return answer, tools_used
                     logger.warning("OpenRouter %s empty answer, trying next", or_model)
                 except Exception as exc:
                     if _or_daily_limit_hit(exc):
-                        _or_exhausted_until = _time.time() + 3600
-                        logger.warning("OpenRouter daily limit hit — skipping OR for 1 h")
+                        _or_entry[1] = _time.time() + 3600
+                        logger.warning("OpenRouter account daily limit hit — trying next account")
+                        _or_daily_hit = True
                         break
                     logger.warning("OpenRouter %s failed (%s), trying next", or_model, exc)
+            if not _or_daily_hit:
+                break
 
         # Gemini fallback
         for model in _GEMINI_MODELS:
@@ -668,11 +700,12 @@ async def call_llm_with_tools(prompt: str, allowed_districts: list[str] | None =
 
 # ── Private helpers ──────────────────────────────────────────────────────────
 
-async def _call_groq(prompt: str) -> str:
+async def _call_groq(prompt: str, *, response_format: dict | None = None) -> str:
     resp = await _groq.chat.completions.create(
         model=_QUALITY_MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=400,
+        **({"response_format": response_format} if response_format else {}),
     )
     return resp.choices[0].message.content.strip()
 
